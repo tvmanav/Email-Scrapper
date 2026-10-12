@@ -48,6 +48,12 @@ CLUTCH_COUNTRY_CATEGORY = os.getenv("CLUTCH_COUNTRY_CATEGORY", "developers")
 CLUTCH_COUNTRY_MAX_PAGES = int(os.getenv("CLUTCH_COUNTRY_MAX_PAGES", "100"))
 COUNTRIES_DONE_FILE = "clutch_countries_done.txt"
 
+# SOURCE=rerun_generic re-analyses rows that only have generic mailboxes with
+# the LLM, as far as the daily token quota reaches, and resumes next day.
+# RERUN_MAX caps one run (0 = until the quota runs out).
+RERUN_DONE_FILE = "rerun_done.txt"
+RERUN_MAX = int(os.getenv("RERUN_MAX", "0"))
+
 # Groq exposes an OpenAI-compatible endpoint, so the official `openai`
 # SDK is reused as the client, just pointed at Groq instead of OpenAI.
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -59,7 +65,7 @@ USE_LLM = os.getenv("USE_LLM", "1").lower() not in ("0", "false", "no", "off")
 
 # Where the company list comes from: "clutch" or "zakelijkeregister".
 SOURCE = os.getenv("SOURCE", "clutch").lower()
-OUTPUT_FILE = "company_emails.csv" if SOURCE in ("clutch", "clutch_all", "clutch_countries") else f"company_emails_{SOURCE}.csv"
+OUTPUT_FILE = "company_emails.csv" if SOURCE in ("clutch", "clutch_all", "clutch_countries", "rerun_generic") else f"company_emails_{SOURCE}.csv"
 
 # zakelijkeregister.nl is a plain-HTML Dutch directory (robots.txt allows
 # crawling). Its search sometimes answers with an empty page and succeeds on
@@ -258,7 +264,17 @@ def decode_cloudflare_email(hex_string: str) -> Optional[str]:
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif")
 
 # Placeholder and error-tracking addresses that are never a real contact.
-IGNORED_EMAIL_DOMAINS = ("example.com", "example.org", "example.net", "sentry.io", "wixpress.com")
+IGNORED_EMAIL_DOMAINS = (
+    "example.com", "example.org", "example.net", "sentry.io", "wixpress.com",
+    "company.com", "yourcompany.com", "yourdomain.com", "yoursite.com", "mydomain.com",
+    "domain.com", "email.com", "sample.com", "test.com",
+)
+
+# Form-field hints ("you@", "name@") that appear in front of any domain.
+PLACEHOLDER_EMAIL_LOCALS = {
+    "you", "your", "yourname", "your.name", "name", "email", "user", "username",
+    "firstname.lastname", "first.last", "john.doe", "jane.doe", "johndoe", "janedoe",
+}
 
 
 def extract_emails(text: str) -> List[str]:
@@ -271,7 +287,7 @@ def extract_emails(text: str) -> List[str]:
         email = normalize_email(email)
         domain = email.split("@")[-1]
 
-        if email.endswith(IMAGE_EXTENSIONS):
+        if email.endswith(IMAGE_EXTENSIONS) or email.split("@")[0] in PLACEHOLDER_EMAIL_LOCALS:
             continue
         if any(domain == ignored or domain.endswith("." + ignored) for ignored in IGNORED_EMAIL_DOMAINS):
             continue
@@ -317,6 +333,31 @@ def domain_matches(email_domain: str, site_domain: str) -> bool:
     return bool(site_domain) and (
         email_domain == site_domain or email_domain.endswith("." + site_domain)
     )
+
+
+SECOND_LEVEL_SUFFIXES = {"co", "com", "org", "net", "gov", "ac", "edu"}
+
+
+def brand_label(domain: str) -> str:
+    """The company-name part of a domain: acme.co.uk, shop.acme.de and acme.com all give "acme"."""
+    parts = domain.lower().strip(".").split(".")
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in SECOND_LEVEL_SUFFIXES:
+        label = parts[-3]
+    else:
+        label = parts[-2] if len(parts) >= 2 else parts[0]
+
+    return label.replace("-", "")
+
+
+def brand_matches(email_domain: str, site_domain: str) -> bool:
+    """
+    Same company across regional/parent domains (euvic.de for euvic.com,
+    kingsmendv.com for go.kingsmendv.com), but not a look-alike or another
+    company's address (fulrum.rocks for fulcrum.rocks, an agency's mailbox).
+    """
+    a, b = brand_label(email_domain), brand_label(site_domain)
+
+    return bool(a and b) and (a == b or (min(len(a), len(b)) >= 5 and (a.startswith(b) or b.startswith(a))))
 
 
 def is_safe_url(url: str) -> bool:
@@ -1514,6 +1555,12 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
             if email.startswith(GENERIC_EMAIL_PREFIXES)
         }
 
+    # An address on someone else's domain (a partner, an agency, a typo'd
+    # look-alike) is not this company's contact, wherever it was found.
+    if pages:
+        site_domain = get_domain(pages[0].url)
+        contact_emails = {email for email in contact_emails if brand_matches(email.split("@")[-1], site_domain)}
+
     # Still nothing: any address on the company's own domain beats an empty
     # cell (e.g. post@ or jan@), while third-party addresses stay excluded.
     if not contact_emails and pages:
@@ -2050,6 +2097,99 @@ def run_companies(companies: List[Company], retry_queue: list) -> list:
     return [row for row in rows if row is not None]
 
 
+def parse_people(field: str) -> List[Person]:
+    """Inverse of format_person: "Name | Title | LinkedIn | Email" entries joined by "; "."""
+    people = []
+    for entry in field.split("; "):
+        parts = [part.strip() for part in entry.split(" | ")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        title = parts[1]
+        unverified = title.endswith(" [unverified]")
+        people.append(Person(
+            name=parts[0],
+            title=title.removesuffix(" [unverified]"),
+            linkedin_url=parts[2] if len(parts) > 2 else "",
+            email=parts[3] if len(parts) > 3 else "",
+            unverified=unverified,
+        ))
+
+    return people
+
+
+def rerun_row(row: dict) -> Optional[dict]:
+    """
+    Re-crawls one row's site and asks the LLM for its decision makers.
+    Returns the updated row, or None when the crawl failed (nothing was
+    learned, so the row stays eligible). Lets RateLimitError through.
+    """
+    company = Company(name=row["company_name"], url=row["company_url"])
+    pages = crawl_company(Company(name=company.name, url=company.url))
+    if not pages:
+        return None
+
+    validated = validate_result(analyze_with_llm(company, pages), pages)
+
+    old_people = parse_people(row["decision_makers"])
+    old_by_name = {alnum(person.name): person for person in old_people}
+    people = []
+    for dm in validated.decision_makers:
+        previous = old_by_name.pop(alnum(dm.name), None)
+        people.append(Person(
+            name=dm.name, title=dm.title, email=dm.email,
+            linkedin_url=previous.linkedin_url if previous else "",
+        ))
+    people += list(old_by_name.values())
+    people = people[:MAX_DECISION_MAKERS]
+
+    attach_site_emails(people, pages, company)
+
+    dm_emails = sorted({e for e in row["decision_maker_emails"].split(";") if e} | {p.email for p in people if p.email})
+    contacts = [e for e in row["contact_emails"].split(";") if e and e not in dm_emails]
+
+    return build_row(company, dm_emails, contacts, row["company_linkedin"], people)
+
+
+def rerun_generic():
+    """Gives rows with only generic mailboxes an LLM pass, until the daily quota runs out."""
+    rows = pd.read_csv(OUTPUT_FILE, dtype=str, keep_default_na=False).to_dict("records")
+    done = read_lines(RERUN_DONE_FILE)
+    todo = [row for row in rows if not row["decision_maker_emails"] and row["company_url"] not in done]
+    logger.info("%d rows have no decision-maker email, %d not yet re-analysed", sum(1 for r in rows if not r["decision_maker_emails"]), len(todo))
+
+    processed = improved = 0
+
+    for row in todo:
+        if 0 < RERUN_MAX <= processed:
+            break
+
+        try:
+            updated = rerun_row(row)
+        except RateLimitError:
+            logger.warning("Groq quota used up after %d companies; run again later to continue.", processed)
+            break
+        except Exception:
+            logger.exception("Re-analysis failed: %s", row["company_name"])
+            continue
+
+        if updated is None:
+            logger.warning("No pages found, left for a later run: %s", row["company_name"])
+            continue
+
+        updated["company_url"] = row["company_url"]
+        processed += 1
+        if updated["decision_maker_emails"]:
+            improved += 1
+        row.update(updated)
+
+        with open(RERUN_DONE_FILE, "a") as f:
+            f.write(row["company_url"] + "\n")
+        pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
+        logger.info("[%d] %s -> %s", processed, row["company_name"], updated["decision_maker_emails"] or "no decision-maker email")
+
+    logger.info("Re-analysed %d companies, %d now have a decision-maker email.", processed, improved)
+
+
 def clutch_page_url(base_url: str, page: int) -> str:
     return f"{base_url}{'&' if '?' in base_url else '?'}page={page}"
 
@@ -2224,6 +2364,12 @@ def main():
         companies = extract_zakelijkeregister_companies(ZR_QUERY)
     elif SOURCE == "clutch":
         companies = extract_clutch_companies(CLUTCH_URL)
+    elif SOURCE == "rerun_generic":
+        if not USE_LLM:
+            raise RuntimeError("rerun_generic needs the LLM: unset USE_LLM=0.")
+        rerun_generic()
+        logger.info("Finished.")
+        return
     elif SOURCE == "clutch_countries":
         run_countries(CLUTCH_COUNTRIES or discover_clutch_countries())
         logger.info("Finished.")
@@ -2236,7 +2382,7 @@ def main():
         logger.info("Finished.")
         return
     else:
-        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries' or 'zakelijkeregister'.")
+        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries', 'rerun_generic' or 'zakelijkeregister'.")
 
     if MAX_COMPANIES > 0:
         companies = companies[:MAX_COMPANIES]

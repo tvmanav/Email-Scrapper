@@ -260,3 +260,34 @@ class TestLinkedInUrl:
     ])
     def test_invalid(self, url):
         assert m.normalize_linkedin_url(url) is None
+
+
+class TestPlaceholderEmails:
+    @pytest.mark.parametrize("text", [
+        "you@company.com", "name@yourdomain.com", "you@acme.nl", "first.last@acme.nl", "email@acme.nl", "john.doe@email.com",
+    ])
+    def test_placeholders_are_dropped(self, text):
+        assert m.extract_emails(f"write to {text} today") == []
+
+    def test_real_addresses_survive(self, ):
+        assert m.extract_emails("info@acme.nl and jane.smith@acme.nl") == ["info@acme.nl", "jane.smith@acme.nl"]
+
+
+class TestBrandMatches:
+    @pytest.mark.parametrize("email_domain,site,expected", [
+        ("acme.com", "acme.com", True),
+        ("acme.de", "acme.com", True),            # regional office of the same brand
+        ("kingsmendv.com", "go.kingsmendv.com", True),
+        ("acme.co.uk", "www.acme.com", True),
+        ("sapientpro.com", "sapient.pro", True),   # same brand with a suffix
+        ("bix-tech.com", "bixtech.ai", True),      # hyphen is not a different brand
+        ("fulrum.rocks", "fulcrum.rocks", False),  # typo'd look-alike
+        ("mightybyte.us", "appmakersla.com", False),
+        ("gmail.com", "acme.com", False),
+        ("ace.com", "acme.com", False),            # short labels need an exact match
+    ])
+    def test_cases(self, email_domain, site, expected):
+        assert m.brand_matches(email_domain, site) is expected
+
+    def test_label_handles_second_level_suffixes(self):
+        assert m.brand_label("shop.acme.co.uk") == "acme" and m.brand_label("acme.com") == "acme"

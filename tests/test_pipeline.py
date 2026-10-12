@@ -693,3 +693,94 @@ class TestClutchCountries:
         monkeypatch.setattr(m, "run_countries", lambda countries: seen.append(countries))
         m.main()
         assert seen == [["se", "no"]]
+
+
+class TestRerunGeneric:
+    HEAD = ["company_name", "company_url", "decision_maker_emails", "contact_emails", "company_linkedin", "decision_makers"]
+
+    @pytest.fixture
+    def csv_file(self, tmp_path, monkeypatch):
+        out = tmp_path / "out.csv"
+        monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
+        monkeypatch.setattr(m, "RERUN_DONE_FILE", str(tmp_path / "rerun_done.txt"))
+        rows = [
+            ["A", "https://a.com", "", "info@a.com", "https://www.linkedin.com/company/a", "Ann Lee | Founder [unverified] | https://www.linkedin.com/in/annlee | "],
+            ["B", "https://b.com", "", "info@b.com", "", ""],
+            ["C", "https://c.com", "ceo@c.com", "", "", "Cy Doe | CEO | | ceo@c.com"],
+        ]
+        pd.DataFrame(rows, columns=self.HEAD).to_csv(out, index=False, quoting=1)
+        return out
+
+    def run(self, monkeypatch, decisions, sites=None):
+        """decisions: {company_name: LLMDecision | Exception}"""
+        analysed = []
+
+        def crawl(company):
+            if sites is not None and company.name not in sites:
+                return []
+            return [page(company.url, f"Founder Ann Lee {company.name} ann@{company.url.split('//')[1]} info@{company.url.split('//')[1]}",
+                         emails=[f"ann@{company.url.split('//')[1]}", f"info@{company.url.split('//')[1]}"])]
+
+        def analyse(company, pages):
+            analysed.append(company.name)
+            outcome = decisions[company.name]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(m, "crawl_company", crawl)
+        monkeypatch.setattr(m, "analyze_with_llm", analyse)
+        m.rerun_generic()
+        return analysed
+
+    def test_parse_people_round_trips_format_person(self):
+        people = [m.Person("Ann Lee", "Founder", "ann@a.com", "https://www.linkedin.com/in/ann", True), m.Person("Bo Ek", "CTO")]
+        text = "; ".join(m.format_person(p) for p in people)
+        assert m.parse_people(text) == people
+
+    def test_finds_decision_maker_email_and_keeps_linkedin(self, csv_file, monkeypatch):
+        decision = m.LLMDecision(decision_makers=[dm("Ann Lee", "Founder", "ann@a.com")])
+        analysed = self.run(monkeypatch, {"A": decision, "B": m.LLMDecision()})
+        assert analysed == ["A", "B"]                       # C already has a decision-maker email
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+        row = df[df.company_name == "A"].iloc[0]
+        assert row.decision_maker_emails == "ann@a.com" and row.contact_emails == "info@a.com"
+        assert "https://www.linkedin.com/in/annlee" in row.decision_makers      # earlier LinkedIn link survives
+        assert row.company_url == "https://a.com" and row.company_linkedin.endswith("/company/a")
+
+    def test_untouched_rows_stay_as_they_were(self, csv_file, monkeypatch):
+        self.run(monkeypatch, {"A": m.LLMDecision(), "B": m.LLMDecision()})
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+        assert df[df.company_name == "C"].iloc[0].decision_makers == "Cy Doe | CEO | | ceo@c.com"
+
+    def test_stops_when_quota_runs_out_and_resumes_later(self, csv_file, tmp_path, monkeypatch):
+        quota = TestRerunGeneric.quota_error()
+        analysed = self.run(monkeypatch, {"A": m.LLMDecision(), "B": quota})
+        assert analysed == ["A", "B"]
+        assert (tmp_path / "rerun_done.txt").read_text().split() == ["https://a.com"]   # B is retried next time
+        again = self.run(monkeypatch, {"B": m.LLMDecision()})
+        assert again == ["B"]
+
+    def test_failed_crawl_is_not_marked_done(self, csv_file, tmp_path, monkeypatch):
+        self.run(monkeypatch, {"A": m.LLMDecision()}, sites={"A"})
+        assert (tmp_path / "rerun_done.txt").read_text().split() == ["https://a.com"]
+
+    def test_rerun_max_caps_a_run(self, csv_file, monkeypatch):
+        monkeypatch.setattr(m, "RERUN_MAX", 1)
+        assert self.run(monkeypatch, {"A": m.LLMDecision(), "B": m.LLMDecision()}) == ["A"]
+
+    @staticmethod
+    def quota_error():
+        import httpx2 as httpx
+        response = httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com"))
+        return m.RateLimitError("Rate limit reached on tokens per day", response=response, body=None)
+
+    def test_main_routes_and_requires_llm(self, monkeypatch):
+        monkeypatch.setattr(m, "SOURCE", "rerun_generic")
+        seen = []
+        monkeypatch.setattr(m, "rerun_generic", lambda: seen.append(1))
+        m.main()
+        assert seen == [1]
+        monkeypatch.setattr(m, "USE_LLM", False)
+        with pytest.raises(RuntimeError, match="needs the LLM"):
+            m.main()

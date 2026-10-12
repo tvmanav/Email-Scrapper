@@ -269,3 +269,15 @@ class TestHeuristicsOnlySwitch:
         monkeypatch.setattr(m, "USE_LLM", False)
         monkeypatch.setattr(m, "_analyze_with_llm", lambda *a: pytest.fail("model was called"))
         assert m.analyze_with_llm(m.Company(name="A", url="https://a.com"), []) == m.LLMDecision()
+
+
+class TestForeignDomainContactEmails:
+    def test_llm_pick_on_another_company_domain_is_dropped(self):
+        pages = [page("https://acme.com", "Contact us", ["info@acme.com", "team@partnerco.us"])]
+        result = m.validate_result(m.LLMDecision(contact_emails=["team@partnerco.us", "info@acme.com"]), pages)
+        assert result.contact_emails == ["info@acme.com"]
+
+    def test_regional_domain_of_the_same_brand_is_kept(self):
+        pages = [page("https://acme.com", "Offices", ["info@acme.com", "info@acme.de"])]
+        result = m.validate_result(m.LLMDecision(contact_emails=["info@acme.com", "info@acme.de"]), pages)
+        assert result.contact_emails == ["info@acme.com", "info@acme.de"]
