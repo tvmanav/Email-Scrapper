@@ -3,4 +3,6 @@
 __pycache__/
 *.pyc
 .claude/settings.local.json
-company_emails.csv
+company_emails*.csv
+.coverage
+.pytest_cache/

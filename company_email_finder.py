@@ -1,18 +1,24 @@
+import ipaddress
 import os
 import re
 import csv
 import json
+import socket
+import threading
 import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse, urldefrag, urlsplit, urlunsplit
+from urllib.parse import urlencode, urljoin, urlparse, urldefrag, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from ddgs import DDGS
 from openai import OpenAI, RateLimitError
 from playwright.sync_api import sync_playwright
 from pydantic import BaseModel, Field
@@ -23,33 +29,105 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-CLUTCH_URL = "https://clutch.co/se/developers/healthcare-industry"
+CLUTCH_URL = os.getenv("CLUTCH_URL", "https://clutch.co/se/developers/healthcare-industry")
+
+# SOURCE=clutch_all walks every listing page of CLUTCH_URL (?page=0..N-1),
+# checkpointing the company list and appending results chunk by chunk, so a
+# multi-day run over ~56k companies can be stopped and resumed at any point.
+CLUTCH_ALL_PAGES = int(os.getenv("CLUTCH_ALL_PAGES", "1122"))
+COMPANY_LIST_FILE = "clutch_companies.jsonl"
+PAGES_DONE_FILE = "clutch_pages_done.txt"
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "200"))
 
 # Groq exposes an OpenAI-compatible endpoint, so the official `openai`
 # SDK is reused as the client, just pointed at Groq instead of OpenAI.
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 
-OUTPUT_FILE = "company_emails.csv"
+# USE_LLM=0 skips every model call: emails, LinkedIn links and people come
+# from the validate_result heuristics only. No Groq key or quota is needed.
+USE_LLM = os.getenv("USE_LLM", "1").lower() not in ("0", "false", "no", "off")
 
-MAX_COMPANIES = 0  # 0 = process all companies, e.g. 5 while testing
-MAX_PAGES_PER_COMPANY = 15
+# Where the company list comes from: "clutch" or "zakelijkeregister".
+SOURCE = os.getenv("SOURCE", "clutch").lower()
+OUTPUT_FILE = "company_emails.csv" if SOURCE in ("clutch", "clutch_all") else f"company_emails_{SOURCE}.csv"
+
+# zakelijkeregister.nl is a plain-HTML Dutch directory (robots.txt allows
+# crawling). Its search sometimes answers with an empty page and succeeds on
+# a retry, so empty pages are retried before being treated as the last page.
+ZR_BASE_URL = "https://zakelijkeregister.nl"
+ZR_QUERY = os.getenv("ZR_QUERY", "software")
+ZR_MAX_PAGES = 100
+ZR_PAGE_ATTEMPTS = 3
+
+MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "0"))  # 0 = process all companies, e.g. 5 while testing
+MAX_PAGES_PER_COMPANY = int(os.getenv("MAX_PAGES_PER_COMPANY", "15"))
 REQUEST_TIMEOUT = 20
-CRAWL_DELAY = 0.5
+FETCH_ATTEMPTS = 2  # one retry for timeouts / 429 / 5xx
+CRAWL_DELAY = 0.25
+
+# Companies are processed in parallel. Different sites never slow each other
+# down; the two shared bottlenecks (web search and the Groq model, whose free
+# tier allows ~8K tokens/minute) are serialized by the locks below instead.
+COMPANY_WORKERS = int(os.getenv("WORKERS", "4"))
+LOOKUP_WORKERS = 4  # directory-profile / redirect lookups
 
 # Clutch sits behind a Cloudflare JS challenge, so the listing page
 # must be rendered with a real browser engine (Playwright), not requests.
 CLUTCH_PAGE_TIMEOUT_MS = 30000
 CLUTCH_RENDER_WAIT_MS = 8000
 CLUTCH_MAX_SHOW_MORE_CLICKS = 25
-CLUTCH_RENDER_MAX_ATTEMPTS = 3
+CLUTCH_RENDER_MAX_ATTEMPTS = 4
+CLUTCH_RETRY_DELAY_SECONDS = 10
 
 # A page with no extracted email can't supply a validated email on its
 # own, so the LLM context prioritizes pages that have one and caps
 # total size - Groq's free tier allows only 8K tokens/minute.
-LLM_CONTEXT_CHAR_BUDGET = 16000
-LLM_EMAIL_PAGE_CHAR_LIMIT = 2500
-LLM_NO_EMAIL_PAGE_CHAR_LIMIT = 800
+# On a paid tier raise these (e.g. 16000 / 2500 / 800) for fuller page context.
+LLM_CONTEXT_CHAR_BUDGET = int(os.getenv("LLM_CONTEXT_CHAR_BUDGET", "8000"))
+LLM_EMAIL_PAGE_CHAR_LIMIT = int(os.getenv("LLM_EMAIL_PAGE_CHAR_LIMIT", "1500"))
+LLM_NO_EMAIL_PAGE_CHAR_LIMIT = int(os.getenv("LLM_NO_EMAIL_PAGE_CHAR_LIMIT", "600"))
+LLM_LEADERSHIP_PAGE_CHAR_LIMIT = 2000
+LLM_NO_SIGNAL_CHAR_LIMIT = 600  # page with no email and no job title in it
+LLM_SNIPPET_WINDOW = 250  # chars kept on each side of an email / job title
+
+# When the plain-HTTP crawl finds no email at all, try the usual contact URLs
+# and then a real (non-stealth) browser, for sites that build pages in JS.
+# Both fall back to nothing if a site answers with an error or a block page.
+COMMON_CONTACT_PATHS = (
+    "contact", "contact-us", "kontakt", "kontakta-oss", "about", "about-us",
+    "om-oss", "over-ons", "team", "impressum", "privacy",
+)
+MAX_CONTACT_PROBES = 6
+ENABLE_BROWSER_FALLBACK = True
+BROWSER_FALLBACK_MAX_PAGES = 3
+BROWSER_PAGE_TIMEOUT_MS = 20000
+BROWSER_SETTLE_MS = 2500
+BROWSER_WORKERS = 2
+
+# LinkedIn lookup is free: links on the company's own site come first, and
+# only gaps are filled through a keyless DuckDuckGo search (never LinkedIn
+# itself, which blocks scraping and forbids it in its terms).
+ENABLE_LINKEDIN_SEARCH = True
+MAX_DECISION_MAKERS = 5
+LINKEDIN_MAX_SEARCHES_PER_COMPANY = 6
+LINKEDIN_MAX_ROLE_SEARCHES = 3
+# The role-search fallback is the least reliable path, so it only keeps the
+# top two tiers (Founder/CEO/MD/President, CTO/COO/Partner...) - see role_rank.
+LINKEDIN_FALLBACK_MAX_ROLE_RANK = 1
+# Free search fails at random (timeouts, rate limits), so companies whose
+# LinkedIn data came back incomplete get one more attempt after the main run.
+ENABLE_SECOND_PASS = True
+SECOND_PASS_COOLDOWN_SECONDS = 30
+COMPANY_NAME_SUFFIXES = ("inc", "ltd", "llc", "gmbh", "group", "corp", "co")
+LINKEDIN_SEARCH_RESULTS = 8
+LINKEDIN_SEARCH_DELAY = 2.0  # backoff after a real search error
+LINKEDIN_SEARCH_MIN_INTERVAL = 1.0  # gap between any two searches, across all workers
+LINKEDIN_SEARCH_MAX_ATTEMPTS = 2
+# ddgs defaults to a 5s timeout, well under REQUEST_TIMEOUT and too short
+# whenever its backend is slow - every attempt failed as a timeout rather
+# than getting a chance to succeed.
+LINKEDIN_SEARCH_TIMEOUT = int(os.getenv("LINKEDIN_SEARCH_TIMEOUT", str(REQUEST_TIMEOUT)))
 
 RATE_LIMIT_MAX_RETRIES = 2
 RATE_LIMIT_MAX_WAIT_SECONDS = 90
@@ -62,6 +140,10 @@ HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+# ddgs logs every engine request at INFO, which would drown the run log.
+for noisy_logger in ("ddgs", "primp", "httpx", "httpcore"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 client = OpenAI(api_key=os.getenv("GROQ_API_KEY"), base_url=GROQ_BASE_URL)
 
@@ -78,7 +160,7 @@ robots_cache = {}
 class DecisionMaker(BaseModel):
     name: str
     title: str
-    email: str
+    email: str  # empty string when the site shows no email for this person
 
 
 class LLMDecision(BaseModel):
@@ -90,6 +172,15 @@ class LLMDecision(BaseModel):
 class Company:
     name: str
     url: str
+    linkedin: str = ""  # company LinkedIn page, when the source directory lists one
+    directory_email: str = ""  # email shown by the source directory (same domain as the site)
+
+
+@dataclass
+class LinkedInLink:
+    kind: str  # "company" or "in"
+    url: str
+    context: str  # anchor text / labels / slug, used to match a link to a person
 
 
 @dataclass
@@ -97,6 +188,18 @@ class PageData:
     url: str
     text: str
     emails: List[str]
+    linkedin_links: List[LinkedInLink]
+
+
+@dataclass
+class Person:
+    name: str
+    title: str
+    email: str = ""
+    linkedin_url: str = ""
+    # True when the person came only from a LinkedIn search hit, not from the
+    # company's own website - nothing independent confirms the role.
+    unverified: bool = False
 
 
 # ============================================================
@@ -134,6 +237,13 @@ def decode_cloudflare_email(hex_string: str) -> Optional[str]:
         return None
 
 
+# "logo@2x.png" matches the email regex; these are retina-image filenames.
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif")
+
+# Placeholder and error-tracking addresses that are never a real contact.
+IGNORED_EMAIL_DOMAINS = ("example.com", "example.org", "example.net", "sentry.io", "wixpress.com")
+
+
 def extract_emails(text: str) -> List[str]:
     if not text:
         return []
@@ -142,8 +252,11 @@ def extract_emails(text: str) -> List[str]:
 
     for email in EMAIL_REGEX.findall(text):
         email = normalize_email(email)
+        domain = email.split("@")[-1]
 
-        if "example.com" in email or email.endswith((".png", ".jpg")):
+        if email.endswith(IMAGE_EXTENSIONS):
+            continue
+        if any(domain == ignored or domain.endswith("." + ignored) for ignored in IGNORED_EMAIL_DOMAINS):
             continue
 
         result.add(email)
@@ -161,7 +274,7 @@ def normalize_url(url: str) -> str:
 
     url = url.strip()
 
-    if not url.startswith(("http://", "https://")):
+    if not re.match(r"https?://", url, re.IGNORECASE):
         url = "https://" + url
 
     url, _ = urldefrag(url)
@@ -170,42 +283,133 @@ def normalize_url(url: str) -> str:
 
 
 def get_domain(url: str) -> str:
-    return urlparse(url).netloc.lower().replace("www.", "")
+    # hostname drops credentials and the port; only a *leading* "www." is removed.
+    host = urlparse(url).hostname or ""
+
+    return host.removeprefix("www.")
 
 
 def same_domain(url1: str, url2: str) -> bool:
     return get_domain(url1) == get_domain(url2)
 
 
+def domain_matches(email_domain: str, site_domain: str) -> bool:
+    """True for the site's own domain or a subdomain of it, never a look-alike suffix."""
+    email_domain, site_domain = email_domain.lower(), site_domain.lower()
+
+    return bool(site_domain) and (
+        email_domain == site_domain or email_domain.endswith("." + site_domain)
+    )
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    False when the URL's host resolves to a private, loopback, link-local or
+    otherwise non-public address. Every URL fetched here comes from a
+    scraped site or a redirect chain, so without this check a malicious or
+    compromised page could redirect the crawler at internal infrastructure
+    (e.g. a cloud metadata endpoint) - classic SSRF.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return False
+
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except socket.gaierror:
+        # Nothing to attack if the name doesn't resolve, and a transient DNS
+        # hiccup must not silently drop a legitimate company from the run.
+        return True
+
+    return all(
+        not (ip.is_private or ip.is_loopback or ip.is_link_local
+             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+        for ip in (ipaddress.ip_address(address) for address in addresses)
+    )
+
+
 # ============================================================
 # ROBOTS
 # ============================================================
 
+def load_robots(origin: str) -> Optional[RobotFileParser]:
+    """
+    Fetches robots.txt ourselves rather than via RobotFileParser.read():
+    that has no timeout (a dead host can hang the run) and treats a 401/403
+    answer as "disallow everything", which would silently skip every site
+    behind a firewall. Per RFC 9309 a 4xx answer means "no rules".
+    """
+    try:
+        response = session.get(f"{origin}/robots.txt", timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        # Unreachable robots.txt isn't a signal the site doesn't want to be
+        # crawled, so allow rather than dropping the whole domain.
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    parser = RobotFileParser()
+    parser.parse(response.text.splitlines())
+
+    return parser
+
+
+robots_cache_lock = threading.Lock()
+robots_locks = {}
+
+
 def can_crawl(url: str) -> bool:
-    domain = get_domain(url)
+    if not is_safe_url(url):
+        logger.warning("Refusing to crawl a non-public address: %s", url)
+        return False
 
-    if domain not in robots_cache:
-        rp = RobotFileParser()
-        rp.set_url(f"https://{domain}/robots.txt")
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}"
 
-        try:
-            rp.read()
-            robots_cache[domain] = rp
-        except Exception:
-            # robots.txt couldn't be reached (timeout, DNS failure, etc.).
-            # Unlike an explicit disallow, this isn't a signal the site
-            # doesn't want to be crawled, so default to allowing rather
-            # than silently dropping the whole domain from the run.
-            robots_cache[domain] = True
+    if origin not in robots_cache:
+        # Double-checked locking per origin: without it, concurrent workers
+        # hitting the same new origin for the first time would each fetch
+        # robots.txt themselves instead of sharing one result.
+        with robots_cache_lock:
+            origin_lock = robots_locks.setdefault(origin, threading.Lock())
 
-    rp = robots_cache[domain]
+        with origin_lock:
+            if origin not in robots_cache:
+                robots_cache[origin] = load_robots(origin)
 
-    return True if rp is True else rp.can_fetch(USER_AGENT, url)
+    parser = robots_cache[origin]
+
+    return True if parser is None else parser.can_fetch(USER_AGENT, url)
 
 
 # ============================================================
 # HTTP FETCH
 # ============================================================
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+FETCH_MAX_REDIRECTS = 5
+
+
+class UnsafeRedirect(Exception):
+    pass
+
+
+def get_following_redirects(url: str) -> requests.Response:
+    """session.get that checks every redirect hop, since requests would follow one into an internal address unchecked."""
+    for _ in range(FETCH_MAX_REDIRECTS + 1):
+        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        location = response.headers.get("location")
+
+        if response.status_code not in REDIRECT_STATUS_CODES or not location:
+            return response
+
+        url = urljoin(url, location)
+        if not is_safe_url(url):
+            raise UnsafeRedirect(url)
+
+    raise requests.TooManyRedirects(f"more than {FETCH_MAX_REDIRECTS} redirects")
+
 
 def fetch(url: str) -> Optional[str]:
     url = normalize_url(url)
@@ -217,23 +421,93 @@ def fetch(url: str) -> Optional[str]:
         logger.warning("Blocked by robots.txt: %s", url)
         return None
 
-    try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            response = get_following_redirects(url)
+        except UnsafeRedirect as e:
+            logger.warning("Redirect to a non-public address refused: %s -> %s", url, e)
+            return None
+        except requests.RequestException as e:
+            logger.warning("Request failed (%d/%d): %s | %s", attempt, FETCH_ATTEMPTS, url, e)
+            time.sleep(CRAWL_DELAY * attempt)
+            continue
+
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < FETCH_ATTEMPTS:
+            time.sleep(CRAWL_DELAY * attempt)
+            continue
 
         if response.status_code != 200:
             logger.warning("HTTP %s: %s", response.status_code, url)
             return None
 
-        if "text/html" not in response.headers.get("content-type", "").lower():
+        # "html" also covers application/xhtml+xml; a missing header is tolerated.
+        content_type = response.headers.get("content-type", "").lower()
+        if content_type and "html" not in content_type:
             return None
 
         time.sleep(CRAWL_DELAY)
 
         return response.text
 
-    except requests.RequestException as e:
-        logger.warning("Request failed: %s | %s", url, e)
+    return None
+
+
+# ============================================================
+# LINKEDIN URL HELPERS
+# ============================================================
+
+LINKEDIN_URL_RE = re.compile(
+    r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/(company|in)/([^/?#\s\"'<>]+)", re.IGNORECASE
+)
+
+
+def normalize_linkedin_url(url: str) -> Optional[tuple]:
+    """
+    Returns (kind, canonical_url) or None. Country subdomains (se.linkedin.com),
+    query strings and trailing slashes all collapse to one canonical form.
+    """
+    match = LINKEDIN_URL_RE.search(url or "")
+    if not match:
         return None
+
+    kind, slug = match.group(1).lower(), match.group(2).rstrip("/")
+
+    return kind, f"https://www.linkedin.com/{kind}/{slug}"
+
+
+def alnum(text: str) -> str:
+    # Fold accents so "Dragoș Ștefan" on a site matches "Dragos Stefan" on LinkedIn.
+    folded = unicodedata.normalize("NFKD", (text or "").lower())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+
+    return "".join(re.findall(r"[^\W_]+", folded))
+
+
+def extract_linkedin_links(soup: BeautifulSoup) -> List[LinkedInLink]:
+    links = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        normalized = normalize_linkedin_url(a["href"])
+        if not normalized or normalized[1] in seen:
+            continue
+
+        seen.add(normalized[1])
+        kind, url = normalized
+
+        # Only the link's own labels - a parent container can hold a whole
+        # team grid and would tie every person to every profile.
+        parts = [a.get_text(" ", strip=True), a.get("aria-label", ""), a.get("title", "")]
+        parts += [img.get("alt", "") for img in a.find_all("img")]
+        parent = a.parent
+        if parent and len(parent.find_all("a", href=LINKEDIN_URL_RE)) == 1:
+            parent_text = parent.get_text(" ", strip=True)
+            if len(parent_text) <= 150:
+                parts.append(parent_text)
+
+        links.append(LinkedInLink(kind=kind, url=url, context=" ".join(p for p in parts if p)))
+
+    return links
 
 
 # ============================================================
@@ -242,6 +516,17 @@ def fetch(url: str) -> Optional[str]:
 
 def parse_page(url: str, html: str) -> PageData:
     soup = BeautifulSoup(html, "lxml")
+
+    # Sites built with Next.js & co. ship page data (and sometimes the only
+    # copy of the contact email) inside <script> blocks. Third-party scripts
+    # are full of tracking addresses, so only the company's own domain counts.
+    site_domain = get_domain(url)
+    script_emails = {
+        email
+        for tag in soup.find_all("script")
+        for email in extract_emails(tag.decode_contents().replace("\\u0040", "@"))
+        if domain_matches(email.split("@")[-1], site_domain)
+    }
 
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
@@ -263,12 +548,14 @@ def parse_page(url: str, html: str) -> PageData:
         if decoded:
             tag.string = decoded
 
+    linkedin_links = extract_linkedin_links(soup)
+
     text = soup.get_text(separator=" ", strip=True)
 
     # Scan the cleaned markup (script/style/svg already stripped above)
     # rather than the raw HTML, so analytics/tracking JS can't inject
     # false-positive "emails" into the extracted set.
-    emails = set(extract_emails(str(soup)))
+    emails = set(extract_emails(str(soup))) | script_emails
 
     for a in soup.find_all("a"):
         href = a.get("href", "")
@@ -277,7 +564,7 @@ def parse_page(url: str, html: str) -> PageData:
             if email:
                 emails.add(normalize_email(email))
 
-    return PageData(url=url, text=text, emails=sorted(emails))
+    return PageData(url=url, text=text, emails=sorted(emails), linkedin_links=linkedin_links)
 
 
 # ============================================================
@@ -334,23 +621,67 @@ def render_clutch_listing_html(clutch_url: str) -> str:
         return html
 
 
+CLUTCH_REDIRECT_MAX_HOPS = 8
+CLUTCH_REDIRECT_ATTEMPTS = 2
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+
+
+def is_clutch_host(url: str) -> bool:
+    host = urlsplit(url).hostname or ""
+
+    return host == "clutch.co" or host.endswith(".clutch.co")
+
+
 def resolve_clutch_redirect(redirect_href: str) -> Optional[str]:
     """
     Clutch "Visit Website" links point at r.clutch.co click-tracking
-    redirects, not the company's real site. Follow the redirect chain with a
-    normal HTTP client (no challenge on this subdomain) and strip Clutch's
-    utm_* tracking params from the final URL.
+    redirects, not the company's real site. Follow the chain one hop at a
+    time and stop at the first address outside clutch.co: that address IS the
+    company's website, and requesting it would only make this lookup depend
+    on the company's server being fast (a slow or busy site used to time out
+    here and the company silently vanished from the list).
     """
-    try:
-        response = session.get(redirect_href, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-    except requests.RequestException as e:
-        logger.warning("Failed to resolve Clutch redirect: %s | %s", redirect_href, e)
-        return None
+    url = redirect_href
 
-    parts = urlsplit(response.url)
-    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    for _ in range(CLUTCH_REDIRECT_MAX_HOPS):
+        if not is_safe_url(url):
+            logger.warning("Refusing to follow redirect to a non-public address: %s", url[:120])
+            return None
 
-    return normalize_url(clean_url)
+        response = None
+
+        for attempt in range(1, CLUTCH_REDIRECT_ATTEMPTS + 1):
+            try:
+                response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+                break
+            except requests.RequestException as e:
+                logger.warning(
+                    "Clutch redirect hop failed (%d/%d): %s | %s",
+                    attempt, CLUTCH_REDIRECT_ATTEMPTS, url[:120], e
+                )
+
+        if response is None:
+            return None
+
+        location = response.headers.get("location")
+        if response.status_code not in REDIRECT_STATUS_CODES or not location:
+            return None  # chain ended while still on Clutch: no company address
+
+        url = urljoin(url, location)
+
+        if not is_clutch_host(url):
+            if not is_safe_url(url):
+                logger.warning("Refusing to resolve company address to a non-public address: %s", url[:120])
+                return None
+
+            parts = urlsplit(url)
+            clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+            return normalize_url(clean_url)
+
+    logger.warning("Clutch redirect chain too long: %s", redirect_href[:120])
+
+    return None
 
 
 def extract_clutch_companies(clutch_url: str) -> List[Company]:
@@ -358,8 +689,19 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
 
     rows = []
 
+    last_error = None
+
     for attempt in range(1, CLUTCH_RENDER_MAX_ATTEMPTS + 1):
-        html = render_clutch_listing_html(clutch_url)
+        try:
+            html = render_clutch_listing_html(clutch_url)
+        except Exception as e:
+            # A navigation timeout or browser hiccup is as temporary as an
+            # unresolved Cloudflare challenge: try again before giving up.
+            last_error = e
+            logger.warning("Attempt %d/%d: rendering failed (%s), retrying.", attempt, CLUTCH_RENDER_MAX_ATTEMPTS, e)
+            time.sleep(CLUTCH_RETRY_DELAY_SECONDS)
+            continue
+
         soup = BeautifulSoup(html, "lxml")
         rows = soup.select("div.provider-row")
 
@@ -375,13 +717,15 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
         )
 
     if not rows:
+        if last_error is not None:
+            raise RuntimeError(f"Could not load the Clutch page after {CLUTCH_RENDER_MAX_ATTEMPTS} attempts: {last_error}")
+
         raise RuntimeError(
             "No provider rows found on the Clutch page. "
             "Clutch may have changed its page structure."
         )
 
-    companies = []
-    seen = set()
+    listings = []
 
     for row in rows:
         name_el = row.select_one(".provider__title-link") or row.find(["h2", "h3", "h4"])
@@ -391,7 +735,15 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
         if not name or not link_el or not link_el.get("href"):
             continue
 
-        website = resolve_clutch_redirect(link_el["href"])
+        listings.append((name, link_el["href"]))
+
+    with ThreadPoolExecutor(max_workers=LOOKUP_WORKERS) as pool:
+        websites = list(pool.map(resolve_clutch_redirect, [href for _, href in listings]))
+
+    companies = []
+    seen = set()
+
+    for (name, _), website in zip(listings, websites):
         if not website:
             continue
 
@@ -408,13 +760,124 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
 
 
 # ============================================================
+# ZAKELIJKEREGISTER EXTRACTION
+# ============================================================
+
+NON_COMPANY_SITE_DOMAINS = ("facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com")
+
+
+def fetch_zr_search_page(query: str, page: int) -> List[tuple]:
+    url = f"{ZR_BASE_URL}/zoeken?{urlencode({'q': query, 'page': page})}"
+
+    for attempt in range(1, ZR_PAGE_ATTEMPTS + 1):
+        html = fetch(url)
+
+        if html:
+            soup = BeautifulSoup(html, "lxml")
+            results = [
+                (link.select_one(".search-result-name").get_text(" ", strip=True), urljoin(ZR_BASE_URL, link["href"]))
+                for link in soup.select("li.search-result-item a.search-result-link[href]")
+                if link.select_one(".search-result-name")
+            ]
+            if results:
+                return results
+
+        # Either the last page or one of the site's random empty answers.
+        logger.info("zakelijkeregister page %d empty (attempt %d/%d)", page, attempt, ZR_PAGE_ATTEMPTS)
+        time.sleep(attempt * 3)
+
+    return []
+
+
+def parse_zr_profile(name: str, html: str) -> Optional[Company]:
+    """Reads only the "Gegevens" block - the page also lists unrelated companies."""
+    soup = BeautifulSoup(html, "lxml")
+    details = soup.select_one("div.kv")
+    if not details:
+        return None
+
+    website, email = "", ""
+
+    for label in details.select("div.k"):
+        key = label.get_text(strip=True).lower()
+        value = label.find_next_sibling("div")
+        if not value:
+            continue
+
+        if key == "website":
+            link = value.find("a", href=True)
+            website = link["href"] if link else ""
+        elif key == "e-mail":
+            # The address is assembled by JS from two data attributes.
+            span = value.select_one("[data-email-user][data-email-domain]")
+            if span:
+                email = normalize_email(f"{span['data-email-user']}@{span['data-email-domain']}")
+
+    website = normalize_url(website)
+    domain = get_domain(website)
+    if not domain or domain.endswith(NON_COMPANY_SITE_DOMAINS):
+        return None
+
+    linkedin = ""
+    for a in details.find_all("a", href=True):
+        normalized = normalize_linkedin_url(a["href"])
+        if normalized and normalized[0] == "company":
+            linkedin = normalized[1]
+            break
+
+    # Directory emails are user-submitted, so only trust one on the company's own domain.
+    if email and not domain_matches(email.split("@")[-1], domain):
+        email = ""
+
+    return Company(name=name, url=website, linkedin=linkedin, directory_email=email)
+
+
+def extract_zakelijkeregister_companies(query: str) -> List[Company]:
+    logger.info("Searching zakelijkeregister.nl for: %s", query)
+
+    companies = []
+    seen_profiles = set()
+    seen_domains = set()
+
+    for page in range(1, ZR_MAX_PAGES + 1):
+        results = [r for r in fetch_zr_search_page(query, page) if r[1] not in seen_profiles]
+
+        if not results:
+            break
+
+        with ThreadPoolExecutor(max_workers=LOOKUP_WORKERS) as pool:
+            profile_pages = list(pool.map(fetch, [url for _, url in results]))
+
+        for (name, profile_url), html in zip(results, profile_pages):
+            seen_profiles.add(profile_url)
+
+            company = parse_zr_profile(name, html) if html else None
+
+            if not company or get_domain(company.url) in seen_domains:
+                continue
+
+            seen_domains.add(get_domain(company.url))
+            companies.append(company)
+
+            if 0 < MAX_COMPANIES <= len(companies):
+                logger.info("Found %d companies", len(companies))
+                return companies
+
+    logger.info("Found %d companies", len(companies))
+
+    return companies
+
+
+# ============================================================
 # PAGE DISCOVERY
 # ============================================================
 
 KEYWORDS = [
     "about", "team", "leadership", "management", "contact", "company",
     "people", "founder", "executive", "ceo", "cto", "director", "owner",
-    "principal",
+    "principal", "directie", "directeur", "eigenaar", "oprichter",
+    "medewerkers", "organisatie", "contactgegevens",
+    "privacy", "impressum", "imprint", "disclaimer", "voorwaarden", "kontakt", "kontakta",
 ]
 
 # Exact URL path segments that reliably indicate an about/team/contact
@@ -425,6 +888,11 @@ HIGH_VALUE_PATH_SEGMENTS = {
     "about", "about-us", "aboutus", "who-we-are", "company", "team",
     "our-team", "leadership", "management-team", "people", "founders",
     "executive-team", "contact", "contact-us", "contactus", "get-in-touch",
+    "over-ons", "overons", "wie-zijn-wij", "ons-team", "het-team", "directie",
+    "organisatie", "medewerkers", "contactgegevens", "neem-contact-op",
+    # EU sites must publish a contact email, often only on legal pages.
+    "privacy", "privacy-policy", "privacyverklaring", "impressum", "imprint", "disclaimer",
+    "algemene-voorwaarden", "kontakt", "kontakta-oss",
 }
 
 
@@ -442,6 +910,9 @@ def score_link(text: str, href: str) -> int:
 
 
 def discover_pages(homepage: str, html: str, max_pages: int) -> List[str]:
+    if max_pages <= 0:  # MAX_PAGES_PER_COMPANY = 1 means "homepage only"
+        return []
+
     soup = BeautifulSoup(html, "lxml")
     candidates = []
 
@@ -481,6 +952,84 @@ def discover_pages(homepage: str, html: str, max_pages: int) -> List[str]:
 # CRAWL COMPANY
 # ============================================================
 
+def probe_common_pages(start_url: str, pages: List[PageData]) -> List[PageData]:
+    """Tries the usual contact/about URLs for sites whose menu isn't in the HTML."""
+    parts = urlparse(start_url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    seen = {normalize_url(page.url) for page in pages}
+    found = []
+    probes = 0
+
+    for path in COMMON_CONTACT_PATHS:
+        url = normalize_url(f"{origin}/{path}")
+        if url in seen:
+            continue
+        if probes >= MAX_CONTACT_PROBES:
+            break
+        probes += 1
+
+        html = fetch(url)
+        if html:
+            found.append(parse_page(url, html))
+            if found[-1].emails:
+                break
+
+    return found
+
+
+browser_slots = threading.Semaphore(BROWSER_WORKERS)
+
+
+def render_company_pages(start_url: str) -> List[PageData]:
+    """
+    Opens the site in an ordinary headless browser so client-side rendered
+    pages (React/Next.js shells) show their real content. This is not a
+    workaround for blocking: robots.txt is honoured and any page answering
+    with an error (403, 418, challenge pages) is simply skipped.
+    """
+    if not ENABLE_BROWSER_FALLBACK or not can_crawl(start_url):
+        return []
+
+    rendered = []
+
+    with browser_slots:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_context(user_agent=USER_AGENT, locale="en-US").new_page()
+                queue = [start_url]
+                seen = set()
+
+                while queue and len(rendered) < BROWSER_FALLBACK_MAX_PAGES:
+                    url = queue.pop(0)
+                    key = normalize_url(url)
+                    if key in seen or not can_crawl(url):
+                        continue
+                    seen.add(key)
+
+                    try:
+                        response = page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_PAGE_TIMEOUT_MS)
+                        page.wait_for_timeout(BROWSER_SETTLE_MS)  # let client-side rendering finish
+                    except Exception as e:
+                        logger.warning("Browser render failed: %s | %s", url, e)
+                        continue
+
+                    if response is None or response.status >= 400:
+                        continue
+
+                    html = page.content()
+                    rendered.append(parse_page(url, html))
+
+                    if len(rendered) == 1:
+                        queue += discover_pages(url, html, BROWSER_FALLBACK_MAX_PAGES - 1)
+
+                browser.close()
+        except Exception as e:
+            logger.warning("Browser fallback failed: %s | %s", start_url, e)
+
+    return rendered
+
+
 def crawl_company(company: Company) -> List[PageData]:
     logger.info("Crawling: %s | %s", company.name, company.url)
 
@@ -502,16 +1051,43 @@ def crawl_company(company: Company) -> List[PageData]:
     if not homepage_html:
         return []
 
+    # The root fallback above is the address that actually answered - record
+    # it as the company's URL so the output CSV doesn't keep the original
+    # dead deep link (which a reader would click and get a 404 from).
+    company.url = start_url
+
     pages = [parse_page(start_url, homepage_html)]
     discovered = discover_pages(start_url, homepage_html, MAX_PAGES_PER_COMPANY - 1)
 
+    seen = {normalize_url(start_url)}
+
     for url in discovered:
-        if url == start_url:
+        # "/contact" and "/contact/" (or the homepage with a trailing slash)
+        # are the same page and must not spend a slot of the crawl budget.
+        key = normalize_url(url)
+        if key in seen:
             continue
+        seen.add(key)
 
         html = fetch(url)
         if html:
             pages.append(parse_page(url, html))
+
+    if not any(page.emails for page in pages):
+        pages += probe_common_pages(start_url, pages)
+
+    if not any(page.emails for page in pages):
+        rendered = render_company_pages(start_url)
+
+        if rendered:
+            logger.info("Browser fallback used: %s (%d pages)", company.name, len(rendered))
+
+            # The rendered homepage replaces the plain-HTTP shell if it has more content.
+            if len(rendered[0].text) > len(pages[0].text):
+                pages[0] = rendered[0]
+                rendered = rendered[1:]
+
+            pages += rendered
 
     return pages
 
@@ -520,15 +1096,76 @@ def crawl_company(company: Company) -> List[PageData]:
 # LLM ANALYSIS
 # ============================================================
 
+LEADERSHIP_PATH_SEGMENTS = HIGH_VALUE_PATH_SEGMENTS - {
+    "contact", "contact-us", "contactus", "get-in-touch",
+    "contactgegevens", "neem-contact-op",
+    "privacy", "privacy-policy", "privacyverklaring", "impressum", "imprint", "disclaimer",
+    "algemene-voorwaarden", "kontakt", "kontakta-oss",
+}
+
+
+def is_leadership_page(page: PageData) -> bool:
+    return bool(set(urlparse(page.url).path.lower().strip("/").split("/")) & LEADERSHIP_PATH_SEGMENTS)
+
+
+ROLE_WORDS_RE = re.compile(
+    r"founder|\bceo\b|\bcto\b|\bcoo\b|chief|director|directeur|directie|owner|eigenaar|oprichter"
+    r"|partner|president|head of|hoofd|managing|bestuurder|gesch[aä]ftsf[uü]hrer|inhaber"
+    r"|gr[uü]nder|\bvd\b|grundare|\bvp\b",
+    re.IGNORECASE,
+)
+
+
+def relevant_text(text: str, emails: List[str], limit: int) -> str:
+    """
+    Keeps only the stretches of a page that can matter - around each email and
+    each job title (names sit right next to titles) - instead of the first N
+    characters, which are mostly menus. Fewer tokens, same information.
+    """
+    lowered = text.lower()
+    spans = [(m_.start(), m_.end()) for m_ in ROLE_WORDS_RE.finditer(text)]
+
+    for email in emails:
+        index = lowered.find(email)
+        if index >= 0:
+            spans.append((index, index + len(email)))
+
+    if not spans:
+        return text[:min(limit, LLM_NO_SIGNAL_CHAR_LIMIT)]
+
+    merged = []
+    for start, end in sorted(spans):
+        start, end = max(0, start - LLM_SNIPPET_WINDOW), min(len(text), end + LLM_SNIPPET_WINDOW)
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    return " … ".join(text[start:end] for start, end in merged)[:limit]
+
+
+def has_llm_signal(pages: List[PageData]) -> bool:
+    """False when no page has an email or a job title - the model has nothing to extract."""
+    return any(page.emails or ROLE_WORDS_RE.search(page.text) for page in pages)
+
+
 def prepare_llm_context(company: Company, pages: List[PageData]) -> str:
-    email_pages = [page for page in pages if page.emails]
-    no_email_pages = [page for page in pages if not page.emails and page is pages[0]]
+    # Decision makers no longer need a published email to be useful (they
+    # feed the LinkedIn lookup), so team/about pages go first even when
+    # they contain no email, then other pages that do, then the homepage.
+    ordered = sorted(pages, key=lambda page: (not is_leadership_page(page), not page.emails))
 
     sections = []
     used_chars = 0
 
-    for page in email_pages + no_email_pages:
-        limit = LLM_EMAIL_PAGE_CHAR_LIMIT if page.emails else LLM_NO_EMAIL_PAGE_CHAR_LIMIT
+    for page in ordered:
+        if not (page.emails or is_leadership_page(page) or page is pages[0]):
+            continue
+
+        if is_leadership_page(page):
+            limit = LLM_LEADERSHIP_PAGE_CHAR_LIMIT
+        else:
+            limit = LLM_EMAIL_PAGE_CHAR_LIMIT if page.emails else LLM_NO_EMAIL_PAGE_CHAR_LIMIT
         section = f"""
 URL:
 {page.url}
@@ -537,7 +1174,7 @@ EXTRACTED EMAILS:
 {json.dumps(page.emails)}
 
 PAGE TEXT:
-{page.text[:limit]}
+{relevant_text(page.text, page.emails, limit)}
 """
         if used_chars + len(section) > LLM_CONTEXT_CHAR_BUDGET:
             break
@@ -569,7 +1206,8 @@ email addresses.
 Only return an email if the exact email address appears
 in the supplied website data.
 
-Your main task is to identify decision-maker emails.
+Your main task is to identify the company's decision makers
+(name and title) and, where shown, their email addresses.
 
 Decision makers include people with roles such as:
 
@@ -591,6 +1229,18 @@ Decision makers include people with roles such as:
 - VP / Vice President
 - Head of Department
 
+The website may be in Dutch. Treat Dutch titles the same way:
+
+- Eigenaar / Mede-eigenaar
+- Oprichter
+- Directeur / Algemeen Directeur / Directeur-Eigenaar
+- Bestuurder / Zaakvoerder
+- Technisch / Financieel / Commercieel / Operationeel Directeur
+- Hoofd (head of a department)
+
+German and Swedish titles count too: Geschäftsführer, Inhaber,
+Gründer, VD (verkställande direktör), Grundare, Ägare.
+
 Prioritize actual people over generic departments.
 
 For every decision maker:
@@ -598,20 +1248,23 @@ For every decision maker:
 1. Verify that the person's name appears in the website data.
 2. Verify that their title/role appears or is clearly associated
    with the person.
-3. Verify that the EXACT email address appears in the website data.
+3. Set email to the EXACT email address only if it appears in
+   the website data and belongs to that person; otherwise set
+   email to an empty string "". A decision maker without a
+   published email must still be returned.
 4. Do not associate a generic company email with a person unless
    the website explicitly connects them.
 5. Do not infer email patterns such as first.last@company.com.
 
-If multiple decision makers have publicly displayed emails,
-return ALL of them.
+Return at most 5 decision makers, the most senior first
+(Founder / CEO / Owner / Managing Director before CTO / COO,
+before Directors, VPs and Heads of Department).
 
-If at least one valid decision-maker email exists:
+If at least one returned decision maker has an email:
 
-- return those emails in decision_makers
 - return an empty contact_emails list
 
-If there are NO decision-maker emails:
+If NO returned decision maker has an email:
 
 Return publicly displayed generic/business contact emails
 such as:
@@ -645,7 +1298,25 @@ def parse_rate_limit_wait_seconds(message: str) -> Optional[float]:
     return minutes * 60 + float(match.group(2))
 
 
+llm_lock = threading.Lock()
+
+
 def analyze_with_llm(company: Company, pages: List[PageData]) -> LLMDecision:
+    if not USE_LLM:
+        return LLMDecision()
+
+    # One model call at a time: parallel calls would just share the same small
+    # tokens-per-minute budget and trigger rate-limit errors for everyone.
+    with llm_lock:
+        return _analyze_with_llm(company, pages)
+
+
+def _analyze_with_llm(company: Company, pages: List[PageData]) -> LLMDecision:
+    # Daily free quota is the scarcest resource: skip the call when nothing
+    # in the crawled pages could be extracted anyway.
+    if not has_llm_signal(pages):
+        return LLMDecision()
+
     context = prepare_llm_context(company, pages)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -692,9 +1363,48 @@ def analyze_with_llm(company: Company, pages: List[PageData]) -> LLMDecision:
 # ============================================================
 
 GENERIC_EMAIL_PREFIXES = (
-    "info@", "contact@", "hello@", "office@", "enquiries@", "enquiry@",
+    "administratie@", "receptie@", "info@", "contact@", "hello@", "office@", "enquiries@", "enquiry@",
     "sales@", "business@", "support@", "admin@",
 )
+
+
+ROLE_RANK_PATTERNS = [
+    (3, re.compile(r"\bvp\b|vice[\s-]+president")),
+    # Dutch: a bare "Directeur" is the top role at a small firm; qualified
+    # ones ("Technisch directeur") rank with the CTO/COO tier.
+    (0, re.compile(
+        r"founder|\bceo\b|chief executive|\bowner\b|president|managing director"
+        r"|eigenaar|oprichter|bestuurder|zaakvoerder|algemeen directeur|directeur[\s/-]*eigenaar"
+        r"|^\s*directeur\s*$"
+        r"|gesch[aä]ftsf[uü]hrer|inhaber|gr[uü]nder|\bvd\b|grundare|verkst[aä]llande|[aä]gare"
+    )),
+    (1, re.compile(
+        r"\bcto\b|chief tech|\bcoo\b|chief op|general manager|\bpartner\b"
+        r"|(technisch|operationeel|financieel|commercieel) directeur"
+    )),
+    (2, re.compile(r"director|directeur|directie")),
+    (4, re.compile(r"head of|\bhead\b|\bhoofd\b")),
+]
+
+
+def clean_title(title: str) -> str:
+    """Drops headline/tagline text glued on after a slash or bullet ("CTO at X / Building teams")."""
+    return re.split(r"\s*[/|⁄∕／·•]\s*", title or "")[0].strip()
+
+
+def role_rank(title: str) -> int:
+    """Lower is more senior; 9 means not a recognised decision-maker role."""
+    title = (title or "").lower()
+
+    # "Executive Assistant to the CEO" mentions the role but isn't the role.
+    if re.search(r"assistant|assistent|secretar|sekret", title):
+        return 9
+
+    for rank, pattern in ROLE_RANK_PATTERNS:
+        if pattern.search(title):
+            return rank
+
+    return 9
 
 
 def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
@@ -702,19 +1412,32 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
     for page in pages:
         website_emails.update(page.emails)
 
+    site_text = alnum(" ".join(page.text for page in pages))
+
     decision_makers = []
     seen = set()
 
     for person in result.decision_makers:
-        email = normalize_email(person.email)
-        if email in website_emails and email not in seen:
-            seen.add(email)
-            decision_makers.append(
-                DecisionMaker(name=person.name.strip(), title=person.title.strip(), email=email)
-            )
+        name = person.name.strip()
+        key = alnum(name)
 
-    # If decision-maker emails exist, ignore fallback contact emails.
-    if decision_makers:
+        # The name must genuinely appear on the site - an email is no longer
+        # there to anchor a hallucinated person, so this is the check.
+        if not key or key in seen or key not in site_text:
+            continue
+        seen.add(key)
+
+        email = normalize_email(person.email)
+        if email not in website_emails:
+            email = ""
+
+        decision_makers.append(DecisionMaker(name=name, title=clean_title(person.title), email=email))
+
+    decision_makers.sort(key=lambda person: role_rank(person.title))
+    decision_makers = decision_makers[:MAX_DECISION_MAKERS]
+
+    # If any decision maker has an email, ignore fallback contact emails.
+    if any(person.email for person in decision_makers):
         return LLMDecision(decision_makers=decision_makers, contact_emails=[])
 
     # Otherwise fall back to contact emails. Trust the LLM's picks as long
@@ -735,50 +1458,516 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
             if email.startswith(GENERIC_EMAIL_PREFIXES)
         }
 
-    return LLMDecision(decision_makers=[], contact_emails=sorted(contact_emails))
+    # Still nothing: any address on the company's own domain beats an empty
+    # cell (e.g. post@ or jan@), while third-party addresses stay excluded.
+    if not contact_emails and pages:
+        domain = get_domain(pages[0].url)
+        contact_emails = {email for email in website_emails if domain_matches(email.split("@")[-1], domain)}
+
+    return LLMDecision(decision_makers=decision_makers, contact_emails=sorted(contact_emails))
+
+
+# ============================================================
+# LINKEDIN LOOKUP
+# ============================================================
+
+class SearchBudget:
+    def __init__(self, limit: int):
+        self.remaining = limit
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+search_lock = threading.Lock()
+last_search_at = 0.0
+
+
+def throttle_search():
+    """Space searches LINKEDIN_SEARCH_MIN_INTERVAL apart even with many workers."""
+    global last_search_at
+
+    with search_lock:
+        wait = last_search_at + LINKEDIN_SEARCH_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        last_search_at = time.monotonic()
+
+
+def search_web(query: str, budget: SearchBudget) -> List[dict]:
+    if not ENABLE_LINKEDIN_SEARCH or not budget.take():
+        return []
+
+    for attempt in range(1, LINKEDIN_SEARCH_MAX_ATTEMPTS + 1):
+        throttle_search()
+
+        try:
+            return DDGS(timeout=LINKEDIN_SEARCH_TIMEOUT).text(query, max_results=LINKEDIN_SEARCH_RESULTS) or []
+        except Exception as e:
+            # ddgs raises on timeouts and rate limits, but also to say "no
+            # results" - and asking again never changes that answer.
+            if "no results" in str(e).lower():
+                logger.info("No search results: %s", query)
+                return []
+
+            logger.warning("Search failed (%d/%d): %s | %s", attempt, LINKEDIN_SEARCH_MAX_ATTEMPTS, query, e)
+            time.sleep(LINKEDIN_SEARCH_DELAY * attempt)
+
+    return []
+
+
+def result_head(result: dict) -> str:
+    """
+    DuckDuckGo glues neighbouring result titles onto each title
+    ("Jane Doe - CEO at Acme | LinkedInJohn Roe - ..."), so only the text
+    before the first "LinkedIn" belongs to this result.
+    """
+    title = re.split(r"linkedin", result.get("title", ""), flags=re.IGNORECASE)[0]
+
+    # Long titles are truncated with an ellipsis and the next result's title
+    # follows it, so everything after the first ellipsis belongs to someone else.
+    title = re.split(r"\.\.\.|…", title)[0]
+
+    return title.strip(" |-–—")
+
+
+FORMER_EMPLOYEE_RE = re.compile(r"\b(ex|former|formerly|past)\b", re.IGNORECASE)
+
+
+def company_keys(company: Company) -> set:
+    """Normalised strings that, if found, tie a search hit to this company."""
+    keys = {
+        alnum(company.name),
+        alnum(get_domain(company.url).split(".")[0]),
+        alnum(company.name.split()[0]) if company.name.split() else "",
+    }
+
+    return {key for key in keys if len(key) >= 4}
+
+
+def slug_matches_company(slug: str, keys: set) -> bool:
+    slug = alnum(slug)
+
+    return any(key in slug or (len(slug) >= 4 and slug in key) for key in keys)
+
+
+def find_company_linkedin(company: Company, pages: List[PageData], budget: SearchBudget) -> str:
+    if company.linkedin:
+        return company.linkedin
+
+    keys = company_keys(company)
+    site_links = [link.url for page in pages for link in page.linkedin_links if link.kind == "company"]
+
+    # A site can link other companies (partners, clients, case studies), so
+    # prefer the link that looks like this company's own page.
+    for url in site_links:
+        if slug_matches_company(url.rsplit("/", 1)[-1], keys):
+            return url
+
+    # Numeric or abbreviated slugs (company/1349302) can't be matched by name;
+    # then only the homepage's link (header/footer) is trusted.
+    if pages:
+        for link in pages[0].linkedin_links:
+            if link.kind == "company":
+                return link.url
+
+    for result in search_web(f'site:linkedin.com/company "{company.name}"', budget):
+        normalized = normalize_linkedin_url(result.get("href", ""))
+        if normalized and normalized[0] == "company" and slug_matches_company(normalized[1].rsplit("/", 1)[-1], keys):
+            return normalized[1]
+
+    return ""
+
+
+def name_tokens(name: str) -> List[str]:
+    return [alnum(token) for token in name.split() if len(alnum(token)) >= 2]
+
+
+def find_site_linkedin(person: Person, pages: List[PageData]) -> str:
+    tokens = name_tokens(person.name)
+    if len(tokens) < 2:
+        return ""
+
+    for page in pages:
+        for link in page.linkedin_links:
+            if link.kind != "in":
+                continue
+
+            haystack = alnum(link.url.rsplit("/", 1)[-1] + link.context)
+            if all(token in haystack for token in tokens):
+                return link.url
+
+    return ""
+
+
+def find_search_linkedin(person: Person, company: Company, budget: SearchBudget) -> str:
+    tokens = name_tokens(person.name)
+    if len(tokens) < 2:
+        return ""
+
+    keys = company_keys(company)
+    query = f'site:linkedin.com/in "{person.name}" "{company.name}"'
+
+    for result in search_web(query, budget):
+        normalized = normalize_linkedin_url(result.get("href", ""))
+        if not normalized or normalized[0] != "in":
+            continue
+
+        head = alnum(result_head(result))
+        slug = alnum(normalized[1].rsplit("/", 1)[-1])
+        snippet = alnum(result.get("body", "")[:300])
+
+        name_ok = all(token in head or token in slug for token in tokens)
+        company_ok = any(key in head or key in snippet for key in keys)
+
+        if name_ok and company_ok:
+            return normalized[1]
+
+    return ""
+
+
+def find_people_by_role(company: Company, budget: SearchBudget) -> List[Person]:
+    """
+    Fallback for sites that name nobody: search "<company> CEO/Founder" etc.
+    and keep only hits whose own title line shows a decision-maker role at
+    this company.
+    """
+    keys = company_keys(company)
+    people = {}
+
+    for roles in ("CEO Founder", "Eigenaar Directeur", "CTO COO")[:LINKEDIN_MAX_ROLE_SEARCHES]:
+        for result in search_web(f'site:linkedin.com/in "{company.name}" {roles}', budget):
+            normalized = normalize_linkedin_url(result.get("href", ""))
+            head = result_head(result)
+            if not normalized or normalized[0] != "in" or not head:
+                continue
+
+            parts = re.split(r"\s+[-–—|]\s+", head, maxsplit=1)
+            name = parts[0].strip()
+            title = parts[1].strip() if len(parts) > 1 else ""
+
+            if not (2 <= len(name.split()) <= 4) or any(ch.isdigit() for ch in name):
+                continue
+            title = clean_title(title)
+            if role_rank(title) > LINKEDIN_FALLBACK_MAX_ROLE_RANK or "associate" in title.lower():
+                continue
+            if FORMER_EMPLOYEE_RE.search(head):
+                continue
+
+            # Require the "<role> at <company>" shape so a company that is
+            # merely listed among past employers doesn't count as current.
+            current_role = re.split(r"\bat\b|\bbij\b|@", title, maxsplit=1, flags=re.IGNORECASE)
+            if len(current_role) < 2:
+                continue
+
+            # The employer must be this company exactly ("Scalo", "Scalo Inc"),
+            # not a namesake such as "Scalo Holdings".
+            employer = alnum(re.split(r"[|,·•(\-–—]", current_role[1])[0])
+            if not any(
+                employer == key or employer in {key + suffix for suffix in COMPANY_NAME_SUFFIXES}
+                for key in keys
+            ):
+                continue
+
+            people.setdefault(normalized[1], Person(name=name, title=title, linkedin_url=normalized[1], unverified=True))
+
+    return sorted(people.values(), key=lambda person: role_rank(person.title))
+
+
+def enrich_linkedin(company: Company, pages: List[PageData], validated: LLMDecision) -> tuple:
+    budget = SearchBudget(LINKEDIN_MAX_SEARCHES_PER_COMPANY)
+
+    company_linkedin = find_company_linkedin(company, pages, budget)
+
+    people = [
+        Person(name=dm.name, title=dm.title, email=dm.email)
+        for dm in validated.decision_makers
+    ]
+
+    for person in people:
+        person.linkedin_url = (
+            find_site_linkedin(person, pages) or find_search_linkedin(person, company, budget)
+        )
+
+    if not people:
+        people = find_people_by_role(company, budget)[:MAX_DECISION_MAKERS]
+
+    return company_linkedin, people
+
+
+# ============================================================
+# MATCH WEBSITE EMAILS TO PEOPLE
+# ============================================================
+
+NAME_NOISE = {"dr", "mr", "mrs", "ms", "prof", "ir", "drs", "mba", "phd", "jr", "sr"}
+
+
+def name_parts(name: str) -> tuple:
+    """(first, last) in folded lowercase letters; last is empty for a one-word name."""
+    words = [alnum(word) for word in re.split(r"[\s,]+", name or "")]
+    words = [word for word in words if word and word not in NAME_NOISE]
+
+    if not words:
+        return "", ""
+
+    return words[0], (words[-1] if len(words) > 1 else "")
+
+
+def email_local_candidates(first: str, last: str) -> set:
+    """Local parts a person's work email commonly takes (compared with separators removed)."""
+    if not last:
+        return set()
+
+    return {
+        first + last, last + first, first[0] + last, last + first[0],
+        first + last[0], last[0] + first,
+    }
+
+
+def match_site_email(person: Person, emails, site_domain: str, other_first_names: list) -> str:
+    """
+    A company-domain address found on the site whose local part is clearly this
+    person's name (john.smith@, jsmith@, john@ when no one else shares the first name).
+    Generic mailboxes (info@, sales@...) never match.
+    """
+    first, last = name_parts(person.name)
+    if not first:
+        return ""
+
+    full_forms = email_local_candidates(first, last)
+    first_is_unique = other_first_names.count(first) <= 1
+
+    for email in sorted(emails):
+        if email.startswith(GENERIC_EMAIL_PREFIXES):
+            continue
+
+        local, _, domain = email.partition("@")
+        if not domain_matches(domain, site_domain):
+            continue
+
+        local = alnum(local)
+        if local in full_forms or (local == first and len(first) >= 3 and first_is_unique):
+            return email
+
+    return ""
+
+
+def attach_site_emails(people: List[Person], pages: List[PageData], company: Company) -> list:
+    """Fills each person's missing email from the site; returns the emails it added."""
+    website_emails = {email for page in pages for email in page.emails}
+    site_domain = get_domain(company.url)
+    first_names = [name_parts(person.name)[0] for person in people]
+    added = []
+
+    for person in people:
+        if person.email:
+            continue
+
+        person.email = match_site_email(person, website_emails, site_domain, first_names)
+        if person.email:
+            added.append(person.email)
+
+    return added
 
 
 # ============================================================
 # PROCESS COMPANY / CSV OUTPUT
 # ============================================================
 
+OUTPUT_COLUMNS = [
+    "company_name", "company_url", "decision_maker_emails", "contact_emails",
+    "company_linkedin", "decision_makers",
+]
+
+
+# Excel/Sheets reads a cell as a formula when its first character is one of
+# these, so a scraped company/person name starting with one (e.g. a company
+# literally named "=1+1") must not reach the CSV verbatim - prefix it with a
+# quote, which every spreadsheet app treats as plain text.
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def sanitize_csv_field(value: str) -> str:
+    return "'" + value if value[:1] in CSV_FORMULA_PREFIXES else value
+
+
 def empty_result(company: Company) -> dict:
-    return {
+    row = {column: "" for column in OUTPUT_COLUMNS} | {
         "company_name": company.name,
         "company_url": company.url,
-        "decision_maker_emails": "",
-        "contact_emails": "",
     }
+    return {column: sanitize_csv_field(value) for column, value in row.items()}
 
 
-def process_company(company: Company) -> dict:
+def format_person(person: Person) -> str:
+    title = f"{person.title} [unverified]" if person.unverified else person.title
+    fields = [person.name, title, person.linkedin_url, person.email]
+
+    return " | ".join(field.replace(";", ",").replace("|", "/") for field in fields)
+
+
+def build_row(company: Company, decision_maker_emails: list, contact_emails: list,
+              company_linkedin: str, people: List[Person]) -> dict:
+    row = {
+        "company_name": company.name,
+        "company_url": company.url,
+        "decision_maker_emails": ";".join(decision_maker_emails),
+        "contact_emails": ";".join(sorted(set(contact_emails))),
+        "company_linkedin": company_linkedin,
+        # Each person is "Name | Title | LinkedIn | Email"; people are joined by "; ".
+        "decision_makers": "; ".join(format_person(person) for person in people),
+    }
+    return {column: sanitize_csv_field(value) for column, value in row.items()}
+
+
+def linkedin_incomplete(company_linkedin: str, people: List[Person]) -> bool:
+    return not company_linkedin or not people or any(not person.linkedin_url for person in people)
+
+
+def process_company(company: Company, retry_queue: list) -> dict:
     try:
         pages = crawl_company(company)
 
         if not pages:
             logger.warning("No pages found: %s", company.name)
+            # Timeouts are often temporary (slow host, busy network): queue a
+            # full second attempt. pages=None marks "crawl again from scratch".
+            retry_queue.append((company, None, None, "", []))
             return empty_result(company)
 
-        llm_result = analyze_with_llm(company, pages)
-        validated = validate_result(llm_result, pages)
+        try:
+            llm_result = analyze_with_llm(company, pages)
+        except Exception:
+            # Quota or API trouble must not throw away emails the crawl already
+            # found: validate_result falls back to its heuristics on an empty result.
+            logger.exception("LLM analysis failed, using heuristics only: %s", company.name)
+            llm_result = LLMDecision()
 
-        return {
-            "company_name": company.name,
-            "company_url": company.url,
-            "decision_maker_emails": ";".join(
-                sorted({person.email for person in validated.decision_makers})
-            ),
-            "contact_emails": ";".join(sorted(set(validated.contact_emails))),
-        }
+        validated = validate_result(llm_result, pages)
+        decision_maker_emails = sorted({dm.email for dm in validated.decision_makers if dm.email})
+        contact_emails = list(validated.contact_emails)
+
+        # Last resort: the source directory's own email for this company.
+        if not decision_maker_emails and not contact_emails and company.directory_email:
+            contact_emails = [company.directory_email]
+
+        # LinkedIn is only the fallback: skip the lookup when the website
+        # already gave us a decision maker's email.
+        company_linkedin, people = "", []
+        if not decision_maker_emails:
+            try:
+                company_linkedin, people = enrich_linkedin(company, pages, validated)
+            except Exception:
+                # LinkedIn is a bonus: its failure must never cost us the emails.
+                logger.exception("LinkedIn lookup failed: %s", company.name)
+
+            # LinkedIn-found people (and every run without the LLM) never got an
+            # email from the model: pair them with addresses already on the site.
+            decision_maker_emails = sorted(set(decision_maker_emails) | set(attach_site_emails(people, pages, company)))
+            contact_emails = [e for e in contact_emails if e not in decision_maker_emails]
+
+            if linkedin_incomplete(company_linkedin, people):
+                # Keep the crawl and LLM result so the retry only repeats the searches.
+                retry_queue.append((company, pages, validated, company_linkedin, people))
+
+        return build_row(company, decision_maker_emails, contact_emails, company_linkedin, people)
 
     except Exception:
         logger.exception("Company failed: %s", company.name)
         return empty_result(company)
 
 
+def merge_people(old: List[Person], new: List[Person]) -> List[Person]:
+    """Fill missing profile links from the retry; never replace what was already found."""
+    if not old:
+        return new
+
+    new_urls = {alnum(person.name): person.linkedin_url for person in new if person.linkedin_url}
+
+    for person in old:
+        if not person.linkedin_url:
+            person.linkedin_url = new_urls.get(alnum(person.name), "")
+
+    return old
+
+
+results_lock = threading.Lock()  # guards result rows and the CSV file
+
+
+def recrawl_company(company: Company, rows_by_url: dict, results: list):
+    """Second attempt for a company whose first crawl found no pages at all."""
+    try:
+        fresh = process_company(company, [])  # throwaway queue: one retry only
+    except Exception:
+        logger.exception("Second crawl failed: %s", company.name)
+        return
+
+    has_data = any(fresh[column] for column in ("decision_maker_emails", "contact_emails", "company_linkedin", "decision_makers"))
+
+    with results_lock:
+        row = rows_by_url.get(company.url)
+        if row is not None and has_data:
+            logger.info("Second crawl recovered: %s", company.name)
+            row.update(fresh)
+            save_results(results)
+
+
+def retry_company(item: tuple, rows_by_url: dict, results: list):
+    company, pages, validated, old_linkedin, old_people = item
+
+    if pages is None:
+        recrawl_company(company, rows_by_url, results)
+        return
+
+    try:
+        new_linkedin, new_people = enrich_linkedin(company, pages, validated)
+    except Exception:
+        logger.exception("Second pass failed: %s", company.name)
+        return
+
+    people = merge_people(old_people, new_people)
+    added = attach_site_emails(people, pages, company)
+
+    with results_lock:
+        row = rows_by_url.get(company.url)
+        if row is None:
+            return
+
+        dm_emails = sorted({e for e in row["decision_maker_emails"].split(";") if e} | set(added))
+        row.update(build_row(
+            company,
+            dm_emails,
+            [e for e in row["contact_emails"].split(";") if e and e not in dm_emails],
+            old_linkedin or new_linkedin,
+            people,
+        ))
+        save_results(results)
+
+
+def second_pass(retry_queue: list, results: list):
+    logger.info(
+        "Second pass: retrying %d companies (failed crawls and missing LinkedIn data) after %ds cool-down",
+        len(retry_queue), SECOND_PASS_COOLDOWN_SECONDS,
+    )
+    time.sleep(SECOND_PASS_COOLDOWN_SECONDS)
+
+    rows_by_url = {row["company_url"]: row for row in results}
+
+    with ThreadPoolExecutor(max_workers=max(1, COMPANY_WORKERS)) as pool:
+        list(pool.map(lambda item: retry_company(item, rows_by_url, results), retry_queue))
+
+
+_suppress_saves = False  # chunked mode appends rows itself instead of rewriting the CSV
+
+
 def save_results(results: list):
-    columns = ["company_name", "company_url", "decision_maker_emails", "contact_emails"]
-    pd.DataFrame(results, columns=columns).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_MINIMAL)
+    if _suppress_saves:
+        return
+
+    pd.DataFrame(results, columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_MINIMAL)
     logger.info("Saved: %s", OUTPUT_FILE)
 
 
@@ -786,24 +1975,127 @@ def save_results(results: list):
 # MAIN
 # ============================================================
 
+def run_companies(companies: List[Company], retry_queue: list) -> list:
+    """Processes companies in parallel; rows come back in the original order."""
+    rows = [None] * len(companies)
+
+    def work(index: int):
+        logger.info("[%d/%d] %s", index + 1, len(companies), companies[index].name)
+
+        row = process_company(companies[index], retry_queue)
+
+        with results_lock:
+            rows[index] = row
+            save_results([r for r in rows if r is not None])  # progress survives a crash
+
+    with ThreadPoolExecutor(max_workers=max(1, COMPANY_WORKERS)) as pool:
+        list(pool.map(work, range(len(companies))))
+
+    return [row for row in rows if row is not None]
+
+
+def clutch_page_url(base_url: str, page: int) -> str:
+    return f"{base_url}{'&' if '?' in base_url else '?'}page={page}"
+
+
+def collect_clutch_all(base_url: str) -> List[Company]:
+    """Walks every listing page, resuming from the checkpoint files."""
+    done = set()
+    if os.path.exists(PAGES_DONE_FILE):
+        with open(PAGES_DONE_FILE) as f:
+            done = {int(line) for line in f if line.strip().isdigit()}
+
+    for page in range(CLUTCH_ALL_PAGES):
+        if page in done:
+            continue
+
+        try:
+            found = extract_clutch_companies(clutch_page_url(base_url, page))
+        except Exception as e:
+            # Leave the page out of the checkpoint so the next run retries it.
+            logger.warning("Listing page %d skipped: %s", page, e)
+            continue
+
+        with open(COMPANY_LIST_FILE, "a") as f:
+            for company in found:
+                f.write(json.dumps({"name": company.name, "url": company.url}) + "\n")
+        with open(PAGES_DONE_FILE, "a") as f:
+            f.write(f"{page}\n")
+
+        logger.info("Listing page %d/%d: %d companies", page + 1, CLUTCH_ALL_PAGES, len(found))
+
+    companies, seen = [], set()
+    if os.path.exists(COMPANY_LIST_FILE):
+        with open(COMPANY_LIST_FILE) as f:
+            for line in f:
+                item = json.loads(line)
+                domain = get_domain(item["url"])
+                if domain and domain not in seen:
+                    seen.add(domain)
+                    companies.append(Company(name=item["name"], url=item["url"]))
+
+    logger.info("Collected %d unique companies", len(companies))
+
+    return companies
+
+
+def run_chunked(companies: List[Company]):
+    """Processes companies in chunks, appending each chunk's rows to the CSV."""
+    global _suppress_saves
+
+    done = set()
+    if os.path.exists(OUTPUT_FILE):
+        done = {get_domain(url) for url in pd.read_csv(OUTPUT_FILE, usecols=["company_url"])["company_url"].dropna()}
+
+    todo = [c for c in companies if get_domain(c.url) not in done]
+    logger.info("%d companies already done, %d to go", len(companies) - len(todo), len(todo))
+
+    for start in range(0, len(todo), CHUNK_SIZE):
+        chunk = todo[start:start + CHUNK_SIZE]
+        retry_queue = []
+
+        _suppress_saves = True
+        try:
+            rows = run_companies(chunk, retry_queue)
+            if ENABLE_SECOND_PASS and retry_queue:
+                second_pass(retry_queue, rows)
+        finally:
+            _suppress_saves = False
+
+        pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(
+            OUTPUT_FILE, mode="a", header=not os.path.exists(OUTPUT_FILE), index=False, quoting=csv.QUOTE_MINIMAL
+        )
+        logger.info("Chunk saved: %d/%d companies done", len(done) + start + len(chunk), len(companies))
+
+
 def main():
-    if not os.getenv("GROQ_API_KEY"):
+    if USE_LLM and not os.getenv("GROQ_API_KEY"):
         raise RuntimeError("GROQ_API_KEY is missing.")
 
-    companies = extract_clutch_companies(CLUTCH_URL)
+    if SOURCE == "zakelijkeregister":
+        companies = extract_zakelijkeregister_companies(ZR_QUERY)
+    elif SOURCE == "clutch":
+        companies = extract_clutch_companies(CLUTCH_URL)
+    elif SOURCE == "clutch_all":
+        companies = collect_clutch_all(CLUTCH_URL)
+        if MAX_COMPANIES > 0:
+            companies = companies[:MAX_COMPANIES]
+        run_chunked(companies)
+        logger.info("Finished.")
+        return
+    else:
+        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all' or 'zakelijkeregister'.")
 
     if MAX_COMPANIES > 0:
         companies = companies[:MAX_COMPANIES]
 
     logger.info("Processing %d companies", len(companies))
 
-    results = []
+    retry_queue = []
+    results = run_companies(companies, retry_queue)
 
-    for index, company in enumerate(companies, start=1):
-        logger.info("[%d/%d] %s", index, len(companies), company.name)
-
-        results.append(process_company(company))
-        save_results(results)  # save after every company so progress isn't lost
+    if ENABLE_SECOND_PASS and retry_queue:
+        second_pass(retry_queue, results)
 
     logger.info("Finished.")
 
