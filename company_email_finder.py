@@ -88,6 +88,14 @@ CLUTCH_RENDER_WAIT_MS = 8000
 CLUTCH_MAX_SHOW_MORE_CLICKS = 25
 CLUTCH_RENDER_MAX_ATTEMPTS = 4
 CLUTCH_RETRY_DELAY_SECONDS = 10
+# Cloudflare's check is passed once by a human in a visible browser
+# (SOURCE=clutch_verify); the cookies live in this profile, which every later
+# headless Clutch render reuses.
+CLUTCH_PROFILE_DIR = os.getenv("CLUTCH_PROFILE_DIR", ".clutch_profile")
+CLUTCH_VERIFY_WAIT_SECONDS = int(os.getenv("CLUTCH_VERIFY_WAIT_SECONDS", "300"))
+# CLUTCH_HEADED=1 renders Clutch in a visible window like the one a human
+# verified in; Cloudflare keeps challenging the headless variant.
+CLUTCH_HEADED = os.getenv("CLUTCH_HEADED", "0").lower() in ("1", "true", "yes", "on")
 
 # A page with no extracted email can't supply a validated email on its
 # own, so the LLM context prioritizes pages that have one and caps
@@ -580,23 +588,17 @@ def parse_page(url: str, html: str) -> PageData:
 # CLUTCH EXTRACTION
 # ============================================================
 
-def render_clutch_listing_html(clutch_url: str) -> str:
-    """
-    Clutch serves a Cloudflare "Just a moment..." JS challenge to plain HTTP
-    clients, so the listing has to be rendered with a real browser engine.
-    Headless Chromium is fingerprinted and blocked by that challenge unless
-    automation markers are hidden.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 900},
-            locale="en-US",
-        )
+def open_clutch_context(p, headless: bool):
+    """Persistent browser profile, so a Cloudflare check passed once keeps counting."""
+    context = p.chromium.launch_persistent_context(
+        CLUTCH_PROFILE_DIR,
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"],
+        user_agent=USER_AGENT,
+        viewport={"width": 1366, "height": 900},
+        locale="en-US",
+    )
+    if headless:
         context.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -605,6 +607,18 @@ def render_clutch_listing_html(clutch_url: str) -> str:
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
             """
         )
+
+    return context
+
+
+def render_clutch_listing_html(clutch_url: str) -> str:
+    """
+    Clutch serves a Cloudflare "Just a moment..." JS challenge to plain HTTP
+    clients, so the listing has to be rendered with a real browser engine,
+    using the profile that a human verified with SOURCE=clutch_verify.
+    """
+    with sync_playwright() as p:
+        context = open_clutch_context(p, headless=not CLUTCH_HEADED)
 
         page = context.new_page()
         page.goto(clutch_url, wait_until="domcontentloaded", timeout=CLUTCH_PAGE_TIMEOUT_MS)
@@ -625,9 +639,39 @@ def render_clutch_listing_html(clutch_url: str) -> str:
             page.wait_for_timeout(1500)
 
         html = page.content()
-        browser.close()
+        context.close()
 
         return html
+
+
+def verify_clutch_access() -> bool:
+    """
+    Opens a visible browser on Clutch so a person can complete Cloudflare's
+    check; returns True once the listing shows. The cookies stay in the
+    profile for the headless runs that follow.
+    """
+    logger.info("A browser window will open: complete Cloudflare's check there (waiting up to %ds).", CLUTCH_VERIFY_WAIT_SECONDS)
+
+    with sync_playwright() as p:
+        context = open_clutch_context(p, headless=False)
+        page = context.new_page()
+        verified = False
+
+        try:
+            page.goto(f"https://clutch.co/{CLUTCH_COUNTRY_CATEGORY}", wait_until="domcontentloaded", timeout=CLUTCH_PAGE_TIMEOUT_MS)
+
+            for _ in range(max(1, CLUTCH_VERIFY_WAIT_SECONDS // 2)):
+                try:
+                    if "provider-row" in page.content():
+                        verified = True
+                        break
+                except Exception:
+                    pass  # the page is mid-navigation, which is what passing the check does
+                page.wait_for_timeout(2000)
+        finally:
+            context.close()
+
+    return verified
 
 
 CLUTCH_REDIRECT_MAX_HOPS = 8
@@ -2166,6 +2210,13 @@ def run_chunked(companies: List[Company]):
 
 
 def main():
+    if SOURCE == "clutch_verify":
+        if verify_clutch_access():
+            logger.info("Clutch verified: later Clutch runs reuse this browser profile.")
+        else:
+            raise RuntimeError("Clutch was not verified in time: the Cloudflare check was not completed.")
+        return
+
     if USE_LLM and not os.getenv("GROQ_API_KEY"):
         raise RuntimeError("GROQ_API_KEY is missing.")
 

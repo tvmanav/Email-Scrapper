@@ -385,13 +385,13 @@ class FakePlaywright:
         class Context:
             def add_init_script(self, script): pass
             def new_page(self): return outer.page
-        class Browser:
-            def new_context(self, **kwargs): return Context()
             def close(self): outer.closed = True
         class P:
             class chromium:
                 @staticmethod
-                def launch(**kwargs): return Browser()
+                def launch_persistent_context(profile_dir, **kwargs):
+                    outer.launch_kwargs = {"profile_dir": profile_dir, **kwargs}
+                    return Context()
         return P
 
     def __exit__(self, *args):
@@ -428,3 +428,57 @@ class TestRenderClutchListing:
         page = FakePage(FakeButton, clicks_until_gone=10**9)
         self.render(monkeypatch, page)
         assert page.clicks == m.CLUTCH_MAX_SHOW_MORE_CLICKS
+
+
+class TestVerifyClutchAccess:
+    def verify(self, monkeypatch, contents):
+        page = FakePage(lambda p: None)
+        shown = iter(contents)
+        page.content = lambda: next(shown, "<html>challenge</html>")
+        fake = FakePlaywright(page)
+        monkeypatch.setattr(m, "sync_playwright", lambda: fake)
+        return m.verify_clutch_access(), fake, page
+
+    def test_succeeds_once_the_listing_shows_and_keeps_the_profile(self, monkeypatch):
+        ok, fake, page = self.verify(monkeypatch, ["challenge", "challenge", '<div class="provider-row">'])
+        assert ok and fake.closed
+        assert fake.launch_kwargs["headless"] is False and fake.launch_kwargs["profile_dir"] == m.CLUTCH_PROFILE_DIR
+
+    def test_a_page_mid_navigation_is_not_fatal(self, monkeypatch):
+        page = FakePage(lambda p: None)
+        answers = iter([RuntimeError("Page.content: page is navigating"), '<div class="provider-row">'])
+        def content():
+            value = next(answers)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        page.content = content
+        fake = FakePlaywright(page)
+        monkeypatch.setattr(m, "sync_playwright", lambda: fake)
+        assert m.verify_clutch_access() and fake.closed
+
+    def test_gives_up_after_the_wait_and_still_closes(self, monkeypatch):
+        monkeypatch.setattr(m, "CLUTCH_VERIFY_WAIT_SECONDS", 6)
+        ok, fake, _ = self.verify(monkeypatch, [])
+        assert not ok and fake.closed
+
+    def test_headless_render_uses_the_same_profile(self, monkeypatch):
+        fake = FakePlaywright(FakePage(lambda p: None))
+        monkeypatch.setattr(m, "sync_playwright", lambda: fake)
+        m.render_clutch_listing_html("https://clutch.co/x")
+        assert fake.launch_kwargs["headless"] is True and fake.launch_kwargs["profile_dir"] == m.CLUTCH_PROFILE_DIR
+
+    def test_main_verify_mode(self, monkeypatch):
+        monkeypatch.setattr(m, "SOURCE", "clutch_verify")
+        monkeypatch.setattr(m, "verify_clutch_access", lambda: True)
+        m.main()
+        monkeypatch.setattr(m, "verify_clutch_access", lambda: False)
+        with pytest.raises(RuntimeError, match="not verified"):
+            m.main()
+
+    def test_headed_mode_renders_in_a_visible_window(self, monkeypatch):
+        monkeypatch.setattr(m, "CLUTCH_HEADED", True)
+        fake = FakePlaywright(FakePage(lambda p: None))
+        monkeypatch.setattr(m, "sync_playwright", lambda: fake)
+        m.render_clutch_listing_html("https://clutch.co/x")
+        assert fake.launch_kwargs["headless"] is False
