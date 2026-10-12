@@ -596,3 +596,100 @@ class TestSiteEmailMatching:
         pages = [m.PageData(url="https://acme.com", text="", emails=["jane.smith@acme.com", "bob.ray@acme.com"], linkedin_links=[])]
         added = m.attach_site_emails(people, pages, m.Company(name="Acme", url="https://acme.com"))
         assert added == ["jane.smith@acme.com"] and people[1].email == "bob@acme.com"
+
+
+class TestClutchCountries:
+    @pytest.fixture
+    def files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "COMPANY_LIST_FILE", str(tmp_path / "companies.jsonl"))
+        monkeypatch.setattr(m, "PAGES_DONE_FILE", str(tmp_path / "pages_done.txt"))
+        monkeypatch.setattr(m, "COUNTRIES_DONE_FILE", str(tmp_path / "countries_done.txt"))
+        return tmp_path
+
+    def listing(self, monkeypatch, pages_by_country):
+        """pages_by_country: {"se": [[Company,...], ...]}; a page past the end raises like Clutch's empty page."""
+        asked = []
+
+        def extract(url):
+            cc = url.split("clutch.co/")[1].split("/")[0]
+            page = int(url.rsplit("page=", 1)[1])
+            asked.append((cc, page))
+            pages = pages_by_country[cc]
+            if page >= len(pages):
+                raise RuntimeError("No provider rows found on the Clutch page.")
+            return pages[page]
+
+        monkeypatch.setattr(m, "extract_clutch_companies", extract)
+        return asked
+
+    def test_walks_pages_until_empty_and_tags_country(self, files, monkeypatch):
+        asked = self.listing(monkeypatch, {"se": [[m.Company("A", "https://a.se")], [m.Company("B", "https://b.se")]]})
+        assert m.collect_clutch_country("se") is True
+        assert asked == [("se", 0), ("se", 1), ("se", 2)]
+        assert [c.name for c in m.load_companies("se")] == ["A", "B"]
+        assert m.load_companies("no") == []
+        assert (files / "pages_done.txt").read_text().split() == ["se:0", "se:1"]
+
+    def test_resumes_after_checkpointed_pages(self, files, monkeypatch):
+        (files / "pages_done.txt").write_text("se:0\n")
+        (files / "companies.jsonl").write_text(json.dumps({"name": "A", "url": "https://a.se", "country": "se"}) + "\n")
+        asked = self.listing(monkeypatch, {"se": [[m.Company("A", "https://a.se")], [m.Company("B", "https://b.se")]]})
+        m.collect_clutch_country("se")
+        assert asked == [("se", 1), ("se", 2)]
+        assert [c.name for c in m.load_companies("se")] == ["A", "B"]
+
+    def test_unloadable_page_leaves_country_for_retry(self, files, monkeypatch):
+        def extract(url):
+            raise RuntimeError("Could not load the Clutch page after 4 attempts: timeout")
+        monkeypatch.setattr(m, "extract_clutch_companies", extract)
+        assert m.collect_clutch_country("se") is False
+        assert not (files / "pages_done.txt").exists()
+
+    def test_empty_first_page_is_a_failure_not_an_empty_country(self, files, monkeypatch):
+        self.listing(monkeypatch, {"us": []})
+        assert m.collect_clutch_country("us") is False
+
+    def test_max_pages_cap(self, files, monkeypatch):
+        monkeypatch.setattr(m, "CLUTCH_COUNTRY_MAX_PAGES", 2)
+        asked = self.listing(monkeypatch, {"se": [[m.Company(f"C{i}", f"https://c{i}.se")] for i in range(5)]})
+        assert m.collect_clutch_country("se") is True
+        assert asked == [("se", 0), ("se", 1)]
+
+    def test_run_countries_crawls_each_country_in_order_and_marks_done(self, files, monkeypatch):
+        self.listing(monkeypatch, {
+            "se": [[m.Company("A", "https://a.se")]],
+            "no": [[m.Company("B", "https://b.no")]],
+        })
+        crawled = []
+        monkeypatch.setattr(m, "run_chunked", lambda companies: crawled.append([c.name for c in companies]))
+        m.run_countries(["se", "no"])
+        assert crawled == [["A"], ["B"]]
+        assert (files / "countries_done.txt").read_text().split() == ["se", "no"]
+
+    def test_finished_countries_are_skipped_and_failed_ones_not_marked(self, files, monkeypatch):
+        (files / "countries_done.txt").write_text("se\n")
+        asked = self.listing(monkeypatch, {"no": [[m.Company("B", "https://b.no")]]})
+        crawled = []
+        monkeypatch.setattr(m, "run_chunked", lambda companies: crawled.append(len(companies)))
+        monkeypatch.setattr(m, "collect_clutch_country", lambda cc: False)
+        m.run_countries(["se", "no"])
+        assert crawled == [] and asked == []
+        assert (files / "countries_done.txt").read_text().split() == ["se"]
+
+    def test_discovers_countries_with_sweden_first(self, monkeypatch):
+        html = '<a href="/no/developers">x</a><a href="https://clutch.co/se/developers/java">y</a><a href="/dk/developers">z</a>'
+        monkeypatch.setattr(m, "render_clutch_listing_html", lambda url: html)
+        assert m.discover_clutch_countries() == ["se", "dk", "no"]
+
+    def test_discovery_gives_a_clear_error_when_blocked(self, monkeypatch):
+        monkeypatch.setattr(m, "render_clutch_listing_html", lambda url: "<title>Just a moment...</title>")
+        with pytest.raises(RuntimeError, match="CLUTCH_COUNTRIES"):
+            m.discover_clutch_countries()
+
+    def test_main_routes_to_countries(self, monkeypatch):
+        monkeypatch.setattr(m, "SOURCE", "clutch_countries")
+        monkeypatch.setattr(m, "CLUTCH_COUNTRIES", ["se", "no"])
+        seen = []
+        monkeypatch.setattr(m, "run_countries", lambda countries: seen.append(countries))
+        m.main()
+        assert seen == [["se", "no"]]

@@ -39,6 +39,15 @@ COMPANY_LIST_FILE = "clutch_companies.jsonl"
 PAGES_DONE_FILE = "clutch_pages_done.txt"
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "200"))
 
+# SOURCE=clutch_countries walks one country at a time (clutch.co/<cc>/<category>),
+# every page until Clutch returns an empty one, then crawls that country's
+# companies before moving to the next. CLUTCH_COUNTRIES="se,no,dk" fixes the
+# list and order; leave it empty to discover the countries from Clutch itself.
+CLUTCH_COUNTRIES = [c.strip().lower() for c in os.getenv("CLUTCH_COUNTRIES", "").split(",") if c.strip()]
+CLUTCH_COUNTRY_CATEGORY = os.getenv("CLUTCH_COUNTRY_CATEGORY", "developers")
+CLUTCH_COUNTRY_MAX_PAGES = int(os.getenv("CLUTCH_COUNTRY_MAX_PAGES", "100"))
+COUNTRIES_DONE_FILE = "clutch_countries_done.txt"
+
 # Groq exposes an OpenAI-compatible endpoint, so the official `openai`
 # SDK is reused as the client, just pointed at Groq instead of OpenAI.
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -50,7 +59,7 @@ USE_LLM = os.getenv("USE_LLM", "1").lower() not in ("0", "false", "no", "off")
 
 # Where the company list comes from: "clutch" or "zakelijkeregister".
 SOURCE = os.getenv("SOURCE", "clutch").lower()
-OUTPUT_FILE = "company_emails.csv" if SOURCE in ("clutch", "clutch_all") else f"company_emails_{SOURCE}.csv"
+OUTPUT_FILE = "company_emails.csv" if SOURCE in ("clutch", "clutch_all", "clutch_countries") else f"company_emails_{SOURCE}.csv"
 
 # zakelijkeregister.nl is a plain-HTML Dutch directory (robots.txt allows
 # crawling). Its search sometimes answers with an empty page and succeeds on
@@ -707,6 +716,9 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
 
         if rows:
             break
+
+        if "Just a moment" in html:
+            last_error = "Cloudflare challenge page"
 
         # The Cloudflare challenge occasionally hasn't fully resolved within
         # the fixed wait time - a fresh attempt usually clears it rather
@@ -1967,7 +1979,7 @@ def save_results(results: list):
     if _suppress_saves:
         return
 
-    pd.DataFrame(results, columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_MINIMAL)
+    pd.DataFrame(results, columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
     logger.info("Saved: %s", OUTPUT_FILE)
 
 
@@ -2024,19 +2036,104 @@ def collect_clutch_all(base_url: str) -> List[Company]:
 
         logger.info("Listing page %d/%d: %d companies", page + 1, CLUTCH_ALL_PAGES, len(found))
 
+    companies = load_companies()
+
+    logger.info("Collected %d unique companies", len(companies))
+
+    return companies
+
+
+def load_companies(country: Optional[str] = None) -> List[Company]:
+    """Unique-by-domain companies from the checkpoint file, optionally only one country's."""
     companies, seen = [], set()
     if os.path.exists(COMPANY_LIST_FILE):
         with open(COMPANY_LIST_FILE) as f:
             for line in f:
                 item = json.loads(line)
                 domain = get_domain(item["url"])
+                if country and item.get("country") != country:
+                    continue
                 if domain and domain not in seen:
                     seen.add(domain)
                     companies.append(Company(name=item["name"], url=item["url"]))
 
-    logger.info("Collected %d unique companies", len(companies))
-
     return companies
+
+
+def read_lines(path: str) -> set:
+    if not os.path.exists(path):
+        return set()
+    with open(path) as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def discover_clutch_countries() -> List[str]:
+    """Country codes from the /<cc>/developers links on Clutch's global listing, Sweden first."""
+    for attempt in range(1, CLUTCH_RENDER_MAX_ATTEMPTS + 1):
+        html = render_clutch_listing_html(f"https://clutch.co/{CLUTCH_COUNTRY_CATEGORY}")
+        codes = set(re.findall(rf'href="(?:https://clutch\.co)?/([a-z]{{2}})/{re.escape(CLUTCH_COUNTRY_CATEGORY)}[/"?]', html))
+        if codes:
+            return sorted(codes, key=lambda code: (code != "se", code))
+        logger.warning("Attempt %d/%d: no country links found, retrying.", attempt, CLUTCH_RENDER_MAX_ATTEMPTS)
+        time.sleep(CLUTCH_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError("Could not discover Clutch countries (Cloudflare challenge?). Set CLUTCH_COUNTRIES=se,no,... instead.")
+
+
+def collect_clutch_country(country: str) -> bool:
+    """
+    Walks one country's listing pages until Clutch returns an empty one,
+    checkpointing each page as "<cc>:<page>". True when the end was reached;
+    False when a page could not be loaded, so the country is retried next run.
+    """
+    base_url = f"https://clutch.co/{country}/{CLUTCH_COUNTRY_CATEGORY}"
+    done_pages = read_lines(PAGES_DONE_FILE)
+
+    for page in range(CLUTCH_COUNTRY_MAX_PAGES):
+        if f"{country}:{page}" in done_pages:
+            continue
+
+        try:
+            found = extract_clutch_companies(clutch_page_url(base_url, page))
+        except RuntimeError as e:
+            if str(e).startswith("No provider rows") and page > 0:
+                logger.info("%s: listing ends after %d pages", country, page)
+                return True
+            logger.warning("%s page %d could not be loaded: %s", country, page, e)
+            return False
+
+        with open(COMPANY_LIST_FILE, "a") as f:
+            for company in found:
+                f.write(json.dumps({"name": company.name, "url": company.url, "country": country}) + "\n")
+        with open(PAGES_DONE_FILE, "a") as f:
+            f.write(f"{country}:{page}\n")
+
+        logger.info("%s page %d: %d companies", country, page + 1, len(found))
+
+    return True
+
+
+def run_countries(countries: List[str]):
+    """Country by country: collect its listing, crawl its companies, then move on."""
+    finished = read_lines(COUNTRIES_DONE_FILE)
+
+    for number, country in enumerate(countries, 1):
+        if country in finished:
+            continue
+
+        logger.info("=== Country %d/%d: %s ===", number, len(countries), country)
+
+        if not collect_clutch_country(country):
+            continue
+
+        companies = load_companies(country)
+        if MAX_COMPANIES > 0:
+            companies = companies[:MAX_COMPANIES]
+        logger.info("%s: %d companies listed", country, len(companies))
+        run_chunked(companies)
+
+        with open(COUNTRIES_DONE_FILE, "a") as f:
+            f.write(f"{country}\n")
 
 
 def run_chunked(companies: List[Company]):
@@ -2063,7 +2160,7 @@ def run_chunked(companies: List[Company]):
             _suppress_saves = False
 
         pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(
-            OUTPUT_FILE, mode="a", header=not os.path.exists(OUTPUT_FILE), index=False, quoting=csv.QUOTE_MINIMAL
+            OUTPUT_FILE, mode="a", header=not os.path.exists(OUTPUT_FILE), index=False, quoting=csv.QUOTE_ALL
         )
         logger.info("Chunk saved: %d/%d companies done", len(done) + start + len(chunk), len(companies))
 
@@ -2076,6 +2173,10 @@ def main():
         companies = extract_zakelijkeregister_companies(ZR_QUERY)
     elif SOURCE == "clutch":
         companies = extract_clutch_companies(CLUTCH_URL)
+    elif SOURCE == "clutch_countries":
+        run_countries(CLUTCH_COUNTRIES or discover_clutch_countries())
+        logger.info("Finished.")
+        return
     elif SOURCE == "clutch_all":
         companies = collect_clutch_all(CLUTCH_URL)
         if MAX_COMPANIES > 0:
@@ -2084,7 +2185,7 @@ def main():
         logger.info("Finished.")
         return
     else:
-        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all' or 'zakelijkeregister'.")
+        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries' or 'zakelijkeregister'.")
 
     if MAX_COMPANIES > 0:
         companies = companies[:MAX_COMPANIES]
