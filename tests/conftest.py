@@ -32,6 +32,10 @@ def isolate(monkeypatch):
     m.robots_cache.clear()
     m._existing_groups_cache = None
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    # main() auto-probes Clutch access for every Clutch-based SOURCE; a test
+    # exercising routing/logic (not the probe itself) never wants a real
+    # Playwright browser launched, so default it to "already verified".
+    monkeypatch.setattr(m, "ensure_clutch_access", lambda: None)
     # A real browser must never start from a test; tests of the fallback
     # switch it on explicitly together with a fake Playwright.
     monkeypatch.setattr(m, "ENABLE_BROWSER_FALLBACK", False)

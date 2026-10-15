@@ -2,6 +2,11 @@ import pytest
 
 import company_email_finder as m
 
+# Captured before the autouse isolate fixture (tests/conftest.py) stubs
+# ensure_clutch_access to a no-op for every other test - TestEnsureClutchAccess
+# below needs the real implementation to exercise it directly.
+_real_ensure_clutch_access = m.ensure_clutch_access
+
 CLUTCH_ROW = ('<div class="provider-row"><a class="provider__title-link">{name}</a>'
               '<a class="website-link__item" href="{href}">Visit</a></div>')
 
@@ -331,3 +336,59 @@ class TestVerifyClutchAccess:
         monkeypatch.setattr(m, "sync_playwright", lambda: fake)
         m.render_clutch_listing_html("https://clutch.co/x")
         assert fake.launch_kwargs["headless"] is False
+
+
+class TestEnsureClutchAccess:
+    """A bare `python3 company_email_finder.py` must work on a machine that
+    never ran SOURCE=clutch_verify by hand: probe headlessly first, and only
+    fall back to the interactive check if that profile isn't cleared."""
+
+    def test_already_verified_skips_the_interactive_check(self, monkeypatch):
+        monkeypatch.setattr(m, "render_clutch_listing_html", lambda url: '<div class="provider-row">')
+        called = []
+        monkeypatch.setattr(m, "verify_clutch_access", lambda: called.append(1) or True)
+        _real_ensure_clutch_access()
+        assert called == []
+
+    def test_cloudflare_challenge_triggers_the_interactive_check(self, monkeypatch):
+        monkeypatch.setattr(m, "render_clutch_listing_html", lambda url: "<title>Just a moment...</title>")
+        called = []
+        monkeypatch.setattr(m, "verify_clutch_access", lambda: called.append(1) or True)
+        _real_ensure_clutch_access()
+        assert called == [1]
+
+    def test_render_exception_also_triggers_the_interactive_check(self, monkeypatch):
+        def boom(url):
+            raise RuntimeError("navigation timeout")
+        monkeypatch.setattr(m, "render_clutch_listing_html", boom)
+        called = []
+        monkeypatch.setattr(m, "verify_clutch_access", lambda: called.append(1) or True)
+        _real_ensure_clutch_access()
+        assert called == [1]
+
+    def test_raises_when_the_interactive_check_is_never_completed(self, monkeypatch):
+        monkeypatch.setattr(m, "render_clutch_listing_html", lambda url: "<title>Just a moment...</title>")
+        monkeypatch.setattr(m, "verify_clutch_access", lambda: False)
+        with pytest.raises(RuntimeError, match="not verified"):
+            _real_ensure_clutch_access()
+
+    def test_main_probes_access_for_every_clutch_based_source(self, monkeypatch):
+        for source in ("clutch", "clutch_all", "clutch_countries"):
+            calls = []
+            monkeypatch.setattr(m, "SOURCE", source)
+            monkeypatch.setattr(m, "ensure_clutch_access", lambda: calls.append(1))
+            monkeypatch.setattr(m, "extract_clutch_companies", lambda url: [])
+            monkeypatch.setattr(m, "collect_clutch_all", lambda url: [])
+            monkeypatch.setattr(m, "run_chunked", lambda companies: None)
+            monkeypatch.setattr(m, "run_countries", lambda countries: None)
+            monkeypatch.setattr(m, "CLUTCH_COUNTRIES", ["se"])
+            m.main()
+            assert calls == [1], f"SOURCE={source!r} did not probe Clutch access"
+
+    def test_main_does_not_probe_access_for_rerun_generic(self, monkeypatch):
+        monkeypatch.setattr(m, "SOURCE", "rerun_generic")
+        called = []
+        monkeypatch.setattr(m, "ensure_clutch_access", lambda: called.append(1))
+        monkeypatch.setattr(m, "rerun_generic", lambda: None)
+        m.main()
+        assert called == []

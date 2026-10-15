@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-CLUTCH_URL = os.getenv("CLUTCH_URL", "https://clutch.co/se/developers/healthcare-industry")
+CLUTCH_URL = os.getenv("CLUTCH_URL", "https://clutch.co/developers")
 
 # SOURCE=clutch_all walks every listing page of CLUTCH_URL (?page=0..N-1),
 # checkpointing the company list and appending results chunk by chunk, so a
@@ -64,8 +64,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 USE_LLM = os.getenv("USE_LLM", "1").lower() not in ("0", "false", "no", "off")
 
 # Where the company list comes from: "clutch", "clutch_all", "clutch_countries",
-# "clutch_verify" or "rerun_generic" - every Clutch-based mode.
-SOURCE = os.getenv("SOURCE", "clutch").lower()
+# "clutch_verify" or "rerun_generic" - every Clutch-based mode. Defaults to
+# the full walk-every-page crawl, so a bare `python3 company_email_finder.py`
+# on a freshly cloned machine does the complete thing with no env vars.
+SOURCE = os.getenv("SOURCE", "clutch_all").lower()
 OUTPUT_FILE = "company_emails.csv"
 
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "0"))  # 0 = process all companies, e.g. 5 while testing
@@ -2490,6 +2492,33 @@ def run_chunked(companies: List[Company]):
         logger.info("Chunk saved: %d/%d companies done", len(done) + start + len(chunk), len(companies))
 
 
+def ensure_clutch_access() -> None:
+    """A bare `python3 company_email_finder.py` on a machine that has never
+    run SOURCE=clutch_verify (or whose profile's Cloudflare clearance has
+    expired) should still work without a separate manual step first: probe
+    with one quick headless request, and only fall back to opening a visible
+    browser for the interactive check if that profile isn't cleared."""
+    try:
+        html = render_clutch_listing_html(f"https://clutch.co/{CLUTCH_COUNTRY_CATEGORY}")
+    except Exception:
+        html = ""
+
+    if "provider-row" in html:
+        return
+
+    logger.info(
+        "Clutch access isn't verified yet (new profile, or an expired one) - "
+        "opening a browser window for the one-time Cloudflare check."
+    )
+    if not verify_clutch_access():
+        raise RuntimeError(
+            "Clutch was not verified in time: a browser window opened for the "
+            "Cloudflare check but it wasn't completed - run this again and "
+            "complete it there."
+        )
+    logger.info("Clutch verified - continuing.")
+
+
 def main():
     if SOURCE == "clutch_verify":
         if verify_clutch_access():
@@ -2500,6 +2529,9 @@ def main():
 
     if USE_LLM and not os.getenv("GROQ_API_KEY"):
         raise RuntimeError("GROQ_API_KEY is missing.")
+
+    if SOURCE in ("clutch", "clutch_all", "clutch_countries"):
+        ensure_clutch_access()
 
     if SOURCE == "clutch":
         companies = extract_clutch_companies(CLUTCH_URL)
