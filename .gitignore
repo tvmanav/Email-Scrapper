@@ -7,3 +7,6 @@ company_emails*.csv
 .coverage
 .pytest_cache/
 .clutch_profile/
+.apollo_profile/
+apollo_enrich_debug/
+apollo_enrich_done.txt
