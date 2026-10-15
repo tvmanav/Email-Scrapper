@@ -14,31 +14,55 @@ def dm(name, title, email=""):
     return m.DecisionMaker(name=name, title=title, email=email)
 
 
+class TestSplitName:
+    def test_two_words(self):
+        assert m.split_name("Jane Doe") == ("Jane", "Doe")
+
+    def test_middle_name_kept_in_last_name(self):
+        assert m.split_name("Mohammed Faleh Al-Qahtani") == ("Mohammed", "Faleh Al-Qahtani")
+
+    def test_single_word(self):
+        assert m.split_name("Madonna") == ("Madonna", "")
+
+    def test_empty(self):
+        assert m.split_name("") == ("", "")
+        assert m.split_name(None) == ("", "")
+
+    def test_join_is_the_inverse(self):
+        for name in ("Jane Doe", "Mohammed Faleh Al-Qahtani", "Madonna"):
+            assert m.join_name(*m.split_name(name)) == name
+
+
 class TestRowHelpers:
     def test_empty_result_has_every_column(self):
         row = m.empty_result(CO)
         assert set(row) == set(m.OUTPUT_COLUMNS)
-        assert row["company_name"] == "Acme" and row["company_url"] == "https://acme.nl" and row["contact_emails"] == ""
+        assert row["company_name"] == "Acme" and row["company_url"] == "https://acme.nl"
+        assert row["decision_maker_email"] == "" and row["company_email"] == ""
 
-    def test_format_person_sanitizes_separators(self):
-        out = m.format_person(P("Jan; de | Vries", "CEO; Owner", "j@a.nl", ))
-        assert ";" not in out.replace("; ", "") and out.count(" | ") == 3
+    def test_build_rows_one_row_per_contact(self):
+        rows = m.build_rows(
+            CO, [P("A B", "CEO", "a@a.nl"), P("C D", "CTO")], ["z@a.nl", "b@a.nl", "b@a.nl"],
+            "https://www.linkedin.com/company/a",
+        )
+        assert len(rows) == 4  # 2 decision makers + 2 deduped generic emails
+        dm_rows = [r for r in rows if r["first_name"]]
+        generic_rows = [r for r in rows if r["company_email"]]
+        assert [(r["first_name"], r["last_name"]) for r in dm_rows] == [("A", "B"), ("C", "D")]
+        assert dm_rows[0]["decision_maker_email"] == "a@a.nl" and dm_rows[1]["decision_maker_email"] == ""
+        assert {r["company_email"] for r in generic_rows} == {"b@a.nl", "z@a.nl"}
+        assert all(row["company_linkedin"].endswith("/a") for row in rows)
 
-    def test_format_person_field_order(self):
-        assert m.format_person(P("Jane Doe", "CEO", "j@a.nl", "https://www.linkedin.com/in/j")) == \
-            "Jane Doe | CEO | https://www.linkedin.com/in/j | j@a.nl"
+    def test_build_rows_unverified_person_marked(self):
+        rows = m.build_rows(CO, [P("Jane Doe", "CEO", linkedin_url="u", unverified=True)], [], "")
+        assert rows[0]["contact_title"] == "CEO [unverified]"
+        assert "[unverified]" not in m.build_rows(CO, [P("Jane Doe", "CEO", linkedin_url="u")], [], "")[0]["contact_title"]
 
-    def test_unverified_people_are_marked_in_output(self):
-        out = m.format_person(P("Jane Doe", "CEO", linkedin_url="u", unverified=True))
-        assert out == "Jane Doe | CEO [unverified] | u | "
-        assert "[unverified]" not in m.format_person(P("Jane Doe", "CEO", linkedin_url="u"))
-
-    def test_build_row_joins_and_dedupes(self):
-        row = m.build_row(CO, ["a@a.nl"], ["z@a.nl", "b@a.nl", "b@a.nl"], "https://www.linkedin.com/company/a",
-                          [P("A B", "CEO"), P("C D", "CTO")])
-        assert row["contact_emails"] == "b@a.nl;z@a.nl"
-        assert row["decision_makers"].count("; ") == 1
-        assert row["company_linkedin"].endswith("/a")
+    def test_build_rows_no_contact_gives_one_placeholder_row(self):
+        rows = m.build_rows(CO, [], [], "")
+        assert len(rows) == 1
+        assert rows[0]["first_name"] == "" and rows[0]["decision_maker_email"] == "" and rows[0]["company_email"] == ""
+        assert rows[0]["company_name"] == "Acme" and rows[0]["company_url"] == "https://acme.nl"
 
     def test_linkedin_incomplete(self):
         done = [P("A B", "CEO", linkedin_url="u")]
@@ -70,6 +94,23 @@ class TestMergePeople:
         assert m.merge_people([], []) == []
 
 
+class TestMergePeopleUnion:
+    def test_each_side_fills_the_others_gaps(self):
+        old = [P("Jane Doe", "CEO", linkedin_url="j")]
+        new = [P("Jane Doe", "", email="jane@a.nl")]
+        merged = m.merge_people_union(old, new)
+        assert len(merged) == 1
+        assert merged[0].title == "CEO" and merged[0].linkedin_url == "j" and merged[0].email == "jane@a.nl"
+
+    def test_names_found_on_only_one_side_are_kept(self):
+        merged = m.merge_people_union([P("Jane Doe", "CEO")], [P("Bob Ray", "CTO")])
+        assert {p.name for p in merged} == {"Jane Doe", "Bob Ray"}
+
+    def test_unverified_only_when_both_sides_are(self):
+        merged = m.merge_people_union([P("Jane Doe", "CEO", unverified=True)], [P("Jane Doe", "CEO", unverified=False)])
+        assert merged[0].unverified is False
+
+
 @pytest.fixture
 def pipeline(monkeypatch):
     """Stub crawl / LLM / LinkedIn so process_company can be exercised in isolation."""
@@ -98,18 +139,35 @@ class TestProcessCompany:
         pipeline["pages"] = [page("https://acme.nl", "Jane Doe CEO", ["jane@acme.nl"])]
         pipeline["llm"] = m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "jane@acme.nl")])
         queue = []
-        row = m.process_company(CO, queue)
-        assert row["decision_maker_emails"] == "jane@acme.nl"
-        assert row["company_linkedin"] == "" and row["decision_makers"] == ""
+        rows = m.process_company(CO, queue)
+        assert len(rows) == 1
+        assert rows[0]["first_name"] == "Jane" and rows[0]["last_name"] == "Doe" and rows[0]["decision_maker_email"] == "jane@acme.nl"
+        assert rows[0]["company_linkedin"] == ""
         assert pipeline["enrich_calls"] == 0 and queue == []
+
+    def test_dm_email_found_still_finds_company_linkedin_for_free(self, pipeline):
+        """find_company_linkedin() checks company.linkedin and the already-
+        crawled pages before ever spending search budget, so skipping the
+        per-person LinkedIn search must not also throw that away."""
+        pipeline["pages"] = [page(
+            "https://acme.nl", "Jane Doe CEO", ["jane@acme.nl"],
+            links=[m.LinkedInLink(kind="company", url="https://www.linkedin.com/company/acme", context="Acme")],
+        )]
+        pipeline["llm"] = m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "jane@acme.nl")])
+        rows = m.process_company(CO, [])
+        assert rows[0]["company_linkedin"] == "https://www.linkedin.com/company/acme"
+        assert pipeline["enrich_calls"] == 0  # still no per-person search spent
 
     def test_no_dm_email_runs_linkedin_and_fills_columns(self, pipeline):
         pipeline["enrich"] = ("https://www.linkedin.com/company/acme",
                               [P("Jane Doe", "CEO", linkedin_url="https://www.linkedin.com/in/jane")])
         queue = []
-        row = m.process_company(CO, queue)
-        assert row["contact_emails"] == "info@acme.nl"
-        assert row["company_linkedin"].endswith("/acme") and "linkedin.com/in/jane" in row["decision_makers"]
+        rows = m.process_company(CO, queue)
+        dm_row = next(r for r in rows if r["first_name"])
+        generic_row = next(r for r in rows if r["company_email"])
+        assert generic_row["company_email"] == "info@acme.nl"
+        assert dm_row["company_linkedin"].endswith("/acme")
+        assert "linkedin.com/in/jane" in dm_row["contact_linkedin"]
         assert pipeline["enrich_calls"] == 1 and queue == []  # complete -> no retry needed
 
     def test_incomplete_linkedin_is_queued_for_second_pass(self, pipeline):
@@ -120,62 +178,71 @@ class TestProcessCompany:
 
     def test_no_pages_gives_empty_row(self, pipeline):
         pipeline["pages"] = []
-        row = m.process_company(CO, [])
-        assert row == m.empty_result(CO) and pipeline["enrich_calls"] == 0
+        rows = m.process_company(CO, [])
+        assert rows == [m.empty_result(CO)] and pipeline["enrich_calls"] == 0
 
     def test_crawl_exception_gives_empty_row(self, pipeline, monkeypatch):
         def boom(company): raise RuntimeError("dns")
         monkeypatch.setattr(m, "crawl_company", boom)
-        assert m.process_company(CO, []) == m.empty_result(CO)
+        assert m.process_company(CO, []) == [m.empty_result(CO)]
 
     def test_llm_failure_falls_back_to_heuristics(self, pipeline):
         pipeline["llm"] = RuntimeError("quota")
-        row = m.process_company(CO, [])
-        assert row["contact_emails"] == "info@acme.nl"
+        rows = m.process_company(CO, [])
+        assert any(r["company_email"] == "info@acme.nl" for r in rows)
 
     def test_linkedin_failure_keeps_emails(self, pipeline):
         pipeline["enrich"] = RuntimeError("search exploded")
         queue = []
-        row = m.process_company(CO, queue)
-        assert row["contact_emails"] == "info@acme.nl" and row["company_linkedin"] == ""
+        rows = m.process_company(CO, queue)
+        assert any(r["company_email"] == "info@acme.nl" for r in rows)
+        assert all(r["company_linkedin"] == "" for r in rows)
         assert len(queue) == 1  # worth another attempt
 
     def test_directory_email_is_last_resort(self, pipeline):
         pipeline["pages"] = [page("https://acme.nl", "hello")]
         co = m.Company("Acme", "https://acme.nl", directory_email="dir@acme.nl")
-        assert m.process_company(co, [])["contact_emails"] == "dir@acme.nl"
+        rows = m.process_company(co, [])
+        assert any(r["company_email"] == "dir@acme.nl" for r in rows)
 
     def test_directory_email_not_used_when_site_has_one(self, pipeline):
         co = m.Company("Acme", "https://acme.nl", directory_email="dir@acme.nl")
-        assert m.process_company(co, [])["contact_emails"] == "info@acme.nl"
+        rows = m.process_company(co, [])
+        assert any(r["company_email"] == "info@acme.nl" for r in rows)
+        assert not any(r["company_email"] == "dir@acme.nl" for r in rows)
 
     def test_decision_maker_without_email_still_listed_via_linkedin(self, pipeline):
         pipeline["llm"] = m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO")])
         pipeline["enrich"] = ("c", [P("Jane Doe", "CEO", linkedin_url="u")])
-        row = m.process_company(CO, [])
-        assert row["decision_maker_emails"] == "" and "Jane Doe" in row["decision_makers"]
+        rows = m.process_company(CO, [])
+        dm_row = next(r for r in rows if r["first_name"])
+        assert dm_row["decision_maker_email"] == "" and (dm_row["first_name"], dm_row["last_name"]) == ("Jane", "Doe")
 
 
 class TestSecondPass:
-    def rows_for(self, *companies):
-        return [m.build_row(c, [], ["info@x.nl"], "", []) for c in companies]
+    def groups_for(self, *companies):
+        return [m.build_rows(c, [], ["info@x.nl"], "") for c in companies]
 
     def test_fills_gaps_and_saves(self, monkeypatch):
         saved = []
         monkeypatch.setattr(m, "save_results", lambda r: saved.append(len(r)))
         monkeypatch.setattr(m, "enrich_linkedin", lambda c, p, v: ("https://www.linkedin.com/company/a",
                             [P("Jane Doe", "CEO", linkedin_url="https://www.linkedin.com/in/j")]))
-        results = self.rows_for(CO)
+        results = self.groups_for(CO)
         m.second_pass([(CO, [], None, "", [])], results)
-        assert results[0]["company_linkedin"].endswith("/a") and "linkedin.com/in/j" in results[0]["decision_makers"]
-        assert results[0]["contact_emails"] == "info@x.nl" and saved
+        group = results[0]
+        dm_row = next(r for r in group if r["first_name"])
+        assert dm_row["company_linkedin"].endswith("/a")
+        assert "linkedin.com/in/j" in dm_row["contact_linkedin"]
+        assert any(r["company_email"] == "info@x.nl" for r in group)
+        assert saved
 
     def test_never_overwrites_existing_company_page(self, monkeypatch):
         monkeypatch.setattr(m, "save_results", lambda r: None)
         monkeypatch.setattr(m, "enrich_linkedin", lambda c, p, v: ("https://www.linkedin.com/company/new", []))
-        results = self.rows_for(CO)
+        results = self.groups_for(CO)
         m.second_pass([(CO, [], None, "https://www.linkedin.com/company/old", [])], results)
-        assert results[0]["company_linkedin"].endswith("/old")
+        assert results[0][0]["company_linkedin"].endswith("/old")
 
     def test_one_failure_does_not_stop_the_rest(self, monkeypatch):
         other = m.Company("Beta", "https://beta.nl")
@@ -185,9 +252,9 @@ class TestSecondPass:
                 raise RuntimeError("x")
             return ("https://www.linkedin.com/company/beta", [])
         monkeypatch.setattr(m, "enrich_linkedin", enrich)
-        results = self.rows_for(CO, other)
+        results = self.groups_for(CO, other)
         m.second_pass([(CO, [], None, "", []), (other, [], None, "", [])], results)
-        assert results[0]["company_linkedin"] == "" and results[1]["company_linkedin"].endswith("/beta")
+        assert results[0][0]["company_linkedin"] == "" and results[1][0]["company_linkedin"].endswith("/beta")
 
     def test_missing_row_is_skipped_not_crashed(self, monkeypatch):
         monkeypatch.setattr(m, "save_results", lambda r: None)
@@ -200,7 +267,7 @@ class TestSecondPass:
         monkeypatch.setattr(time, "sleep", lambda s: waits.append(s))
         monkeypatch.setattr(m, "enrich_linkedin", lambda c, p, v: ("", []))
         monkeypatch.setattr(m, "save_results", lambda r: None)
-        m.second_pass([(CO, [], None, "", [])], self.rows_for(CO))
+        m.second_pass([(CO, [], None, "", [])], self.groups_for(CO))
         assert m.SECOND_PASS_COOLDOWN_SECONDS in waits
 
 
@@ -208,17 +275,36 @@ class TestSaveResults:
     def test_writes_exact_columns_and_unicode(self, tmp_path, monkeypatch):
         out = tmp_path / "out.csv"
         monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
-        rows = [m.build_row(m.Company("Zoë, Inc. \"Q\"", "https://z.nl"), [], ["a@z.nl"], "", [P("Dragoș Ștefan", "COO")])]
+        rows = m.build_rows(m.Company("Zoë, Inc. \"Q\"", "https://z.nl"), [P("Dragoș Ștefan", "COO")], ["a@z.nl"], "")
         m.save_results(rows)
         df = pd.read_csv(out).fillna("")
         assert list(df.columns) == m.OUTPUT_COLUMNS
-        assert df.company_name[0] == 'Zoë, Inc. "Q"' and "Dragoș Ștefan" in df.decision_makers[0]
+        assert df.company_name[0] == 'Zoë, Inc. "Q"'
+        assert "Dragoș" in set(df.first_name) and "Ștefan" in set(df.last_name)
 
     def test_empty_results_still_writes_header(self, tmp_path, monkeypatch):
         out = tmp_path / "out.csv"
         monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
         m.save_results([])
         assert list(pd.read_csv(out).columns) == m.OUTPUT_COLUMNS
+
+    def test_merges_into_existing_file_without_wiping_other_companies(self, tmp_path, monkeypatch):
+        out = tmp_path / "out.csv"
+        monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
+        m.save_results(m.build_rows(m.Company("Acme", "https://acme.com"), [], ["info@acme.com"], ""))
+        m.save_results(m.build_rows(m.Company("Beta", "https://beta.com"), [], ["info@beta.com"], ""))
+        df = pd.read_csv(out)
+        assert set(df.company_name) == {"Acme", "Beta"}
+
+    def test_rerun_of_same_company_updates_in_place_not_duplicates(self, tmp_path, monkeypatch):
+        out = tmp_path / "out.csv"
+        monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
+        co = m.Company("Acme", "https://www.acme.com")
+        m.save_results(m.build_rows(co, [], ["info@acme.com"], ""))
+        m.save_results(m.build_rows(m.Company("Acme", "https://acme.com"), [P("CEO Person", "CEO", "ceo@acme.com")], [], ""))
+        df = pd.read_csv(out).fillna("")
+        assert set(df.company_name) == {"Acme"}
+        assert "ceo@acme.com" in set(df.decision_maker_email) and "info@acme.com" in set(df.company_email)
 
 
 class TestOutputFileNaming:
@@ -287,7 +373,7 @@ class TestRunChunked:
         def run(companies, retry_queue):
             if seen is not None:
                 seen.append([c.name for c in companies])
-            return [m.empty_result(c) for c in companies]
+            return [[m.empty_result(c)] for c in companies]
 
         monkeypatch.setattr(m, "run_companies", run)
 
@@ -327,7 +413,7 @@ class TestRunChunked:
 
         def run(companies, retry_queue):
             suppressed_during_run.append(m._suppress_saves)
-            return [m.empty_result(c) for c in companies]
+            return [[m.empty_result(c)] for c in companies]
 
         monkeypatch.setattr(m, "run_companies", run)
 
@@ -344,7 +430,7 @@ class TestRunChunked:
 
         def run(companies, retry_queue):
             retry_queue.append("retry-me")
-            return [m.empty_result(c) for c in companies]
+            return [[m.empty_result(c)] for c in companies]
 
         monkeypatch.setattr(m, "run_companies", run)
         seen = []
@@ -353,6 +439,24 @@ class TestRunChunked:
         m.run_chunked([m.Company("A", "https://a.com")])
 
         assert seen == [["retry-me"]]
+
+    def test_chunk_error_still_saves_what_was_scraped(self, tmp_path, monkeypatch):
+        out = tmp_path / "out.csv"
+        monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
+        monkeypatch.setattr(m, "CHUNK_SIZE", 10)
+        monkeypatch.setattr(m, "ENABLE_SECOND_PASS", True)
+
+        def run(companies, retry_queue):
+            retry_queue.append("retry-me")
+            return [[m.empty_result(c)] for c in companies]
+
+        monkeypatch.setattr(m, "run_companies", run)
+        monkeypatch.setattr(m, "second_pass", lambda queue, rows: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        m.run_chunked([m.Company("A", "https://a.com")])
+
+        assert list(pd.read_csv(out).fillna("").company_name) == ["A"]
+        assert m._suppress_saves is False
 
 
 class TestMain:
@@ -368,7 +472,7 @@ class TestMain:
             calls["processed"].append(company.name)
             if company.name == "C1":
                 queue.append((company, [], None, "", []))
-            return m.empty_result(company)
+            return [m.empty_result(company)]
         monkeypatch.setattr(m, "process_company", process)
         monkeypatch.setattr(m, "save_results", lambda r: None)
         monkeypatch.setattr(m, "second_pass", lambda q, r: calls.__setitem__("second", len(q)))
@@ -447,16 +551,16 @@ class TestParallelism:
         companies = [m.Company(f"C{i}", f"https://c{i}.nl") for i in range(12)]
         def process(company, queue):
             _time.sleep(0)  # (patched no-op) - completion order is up to the scheduler
-            return m.empty_result(company)
+            return [m.empty_result(company)]
         monkeypatch.setattr(m, "process_company", process)
-        rows = m.run_companies(companies, [])
-        assert [r["company_name"] for r in rows] == [c.name for c in companies]
+        groups = m.run_companies(companies, [])
+        assert [group[0]["company_name"] for group in groups] == [c.name for c in companies]
 
     def test_every_company_processed_exactly_once(self, monkeypatch):
         monkeypatch.setattr(m, "COMPANY_WORKERS", 8)
         monkeypatch.setattr(m, "save_results", lambda rows: None)
         seen = []
-        monkeypatch.setattr(m, "process_company", lambda c, q: seen.append(c.name) or m.empty_result(c))
+        monkeypatch.setattr(m, "process_company", lambda c, q: seen.append(c.name) or [m.empty_result(c)])
         companies = [m.Company(f"C{i}", f"https://c{i}.nl") for i in range(40)]
         m.run_companies(companies, [])
         assert sorted(seen) == sorted(c.name for c in companies)
@@ -465,7 +569,7 @@ class TestParallelism:
         monkeypatch.setattr(m, "COMPANY_WORKERS", 4)
         snapshots = []
         monkeypatch.setattr(m, "save_results", lambda rows: snapshots.append(list(rows)))
-        monkeypatch.setattr(m, "process_company", lambda c, q: m.empty_result(c))
+        monkeypatch.setattr(m, "process_company", lambda c, q: [m.empty_result(c)])
         m.run_companies([m.Company(f"C{i}", f"https://c{i}.nl") for i in range(6)], [])
         assert [len(s) for s in snapshots] == [1, 2, 3, 4, 5, 6]
         assert all(row is not None for snap in snapshots for row in snap)
@@ -474,14 +578,14 @@ class TestParallelism:
     def test_nonpositive_worker_count_still_runs(self, monkeypatch, workers):
         monkeypatch.setattr(m, "COMPANY_WORKERS", workers)
         monkeypatch.setattr(m, "save_results", lambda rows: None)
-        monkeypatch.setattr(m, "process_company", lambda c, q: m.empty_result(c))
+        monkeypatch.setattr(m, "process_company", lambda c, q: [m.empty_result(c)])
         assert len(m.run_companies([m.Company("A", "https://a.nl")], [])) == 1
 
     def test_failing_company_does_not_block_others(self, monkeypatch):
         monkeypatch.setattr(m, "COMPANY_WORKERS", 3)
         monkeypatch.setattr(m, "save_results", lambda rows: None)
         def process(company, queue):
-            return m.empty_result(company)  # process_company itself never raises
+            return [m.empty_result(company)]  # process_company itself never raises
         monkeypatch.setattr(m, "process_company", process)
         assert len(m.run_companies([m.Company(f"C{i}", f"https://c{i}.nl") for i in range(5)], [])) == 5
 
@@ -510,16 +614,16 @@ class TestParallelism:
         monkeypatch.setattr(m, "save_results", lambda r: None)
         monkeypatch.setattr(m, "enrich_linkedin", lambda c, p, v: (f"https://www.linkedin.com/company/{c.name}", []))
         companies = [m.Company(f"c{i}", f"https://c{i}.nl") for i in range(10)]
-        rows = [m.build_row(c, [], [], "", []) for c in companies]
-        m.second_pass([(c, [], None, "", []) for c in companies], rows)
-        assert [r["company_linkedin"] for r in rows] == [f"https://www.linkedin.com/company/c{i}" for i in range(10)]
+        groups = [m.build_rows(c, [], [], "") for c in companies]
+        m.second_pass([(c, [], None, "", []) for c in companies], groups)
+        assert [group[0]["company_linkedin"] for group in groups] == [f"https://www.linkedin.com/company/c{i}" for i in range(10)]
 
 
 class TestRecrawlOfFailedCompanies:
     def test_company_with_no_pages_is_queued_for_full_retry(self, pipeline):
         pipeline["pages"] = []
         queue = []
-        assert m.process_company(CO, queue) == m.empty_result(CO)
+        assert m.process_company(CO, queue) == [m.empty_result(CO)]
         assert len(queue) == 1 and queue[0][0] is CO and queue[0][1] is None
 
     def test_crawl_exception_is_not_queued_as_recrawl(self, pipeline, monkeypatch):
@@ -532,20 +636,20 @@ class TestRecrawlOfFailedCompanies:
     def test_second_pass_recovers_company_on_second_crawl(self, monkeypatch):
         saved = []
         monkeypatch.setattr(m, "save_results", lambda r: saved.append(1))
-        monkeypatch.setattr(m, "process_company", lambda c, q: m.build_row(c, [], ["info@acme.nl"], "", []))
+        monkeypatch.setattr(m, "process_company", lambda c, q: m.build_rows(c, [], ["info@acme.nl"], ""))
         called = []
         monkeypatch.setattr(m, "enrich_linkedin", lambda *a: called.append(1) or ("", []))
-        rows = [m.empty_result(CO)]
-        m.second_pass([(CO, None, None, "", [])], rows)
-        assert rows[0]["contact_emails"] == "info@acme.nl" and saved and called == []
+        groups = [[m.empty_result(CO)]]
+        m.second_pass([(CO, None, None, "", [])], groups)
+        assert groups[0][0]["company_email"] == "info@acme.nl" and saved and called == []
 
     def test_second_crawl_that_finds_nothing_leaves_row_unchanged(self, monkeypatch):
         saved = []
         monkeypatch.setattr(m, "save_results", lambda r: saved.append(1))
-        monkeypatch.setattr(m, "process_company", lambda c, q: m.empty_result(c))
-        rows = [m.empty_result(CO)]
-        m.second_pass([(CO, None, None, "", [])], rows)
-        assert rows[0] == m.empty_result(CO) and saved == []
+        monkeypatch.setattr(m, "process_company", lambda c, q: [m.empty_result(c)])
+        groups = [[m.empty_result(CO)]]
+        m.second_pass([(CO, None, None, "", [])], groups)
+        assert groups[0] == [m.empty_result(CO)] and saved == []
 
     def test_recrawl_failure_does_not_stop_other_retries(self, monkeypatch):
         other = m.Company("Beta", "https://beta.nl")
@@ -553,11 +657,11 @@ class TestRecrawlOfFailedCompanies:
         def process(company, queue):
             if company is CO:
                 raise RuntimeError("boom")
-            return m.build_row(company, [], ["info@beta.nl"], "", [])
+            return m.build_rows(company, [], ["info@beta.nl"], "")
         monkeypatch.setattr(m, "process_company", process)
-        rows = [m.empty_result(CO), m.empty_result(other)]
-        m.second_pass([(CO, None, None, "", []), (other, None, None, "", [])], rows)
-        assert rows[0]["contact_emails"] == "" and rows[1]["contact_emails"] == "info@beta.nl"
+        groups = [[m.empty_result(CO)], [m.empty_result(other)]]
+        m.second_pass([(CO, None, None, "", []), (other, None, None, "", [])], groups)
+        assert groups[0][0]["company_email"] == "" and groups[1][0]["company_email"] == "info@beta.nl"
 
     def test_recrawl_does_not_requeue_itself(self, monkeypatch):
         monkeypatch.setattr(m, "save_results", lambda r: None)
@@ -568,8 +672,8 @@ class TestRecrawlOfFailedCompanies:
             outer.append(queue)
             return real(company, queue)
         monkeypatch.setattr(m, "process_company", spy)
-        rows = [m.empty_result(CO)]
-        m.second_pass([(CO, None, None, "", [])], rows)
+        groups = [[m.empty_result(CO)]]
+        m.second_pass([(CO, None, None, "", [])], groups)
         assert outer and all(q is not None for q in outer) and len(outer[0]) == 1  # its own throwaway list only
 
 
@@ -696,7 +800,8 @@ class TestClutchCountries:
 
 
 class TestRerunGeneric:
-    HEAD = ["company_name", "company_url", "decision_maker_emails", "contact_emails", "company_linkedin", "decision_makers"]
+    HEAD = ["company_name", "company_url", "company_email", "company_linkedin",
+            "first_name", "last_name", "contact_title", "decision_maker_email", "contact_linkedin"]
 
     @pytest.fixture
     def csv_file(self, tmp_path, monkeypatch):
@@ -704,9 +809,11 @@ class TestRerunGeneric:
         monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
         monkeypatch.setattr(m, "RERUN_DONE_FILE", str(tmp_path / "rerun_done.txt"))
         rows = [
-            ["A", "https://a.com", "", "info@a.com", "https://www.linkedin.com/company/a", "Ann Lee | Founder [unverified] | https://www.linkedin.com/in/annlee | "],
-            ["B", "https://b.com", "", "info@b.com", "", ""],
-            ["C", "https://c.com", "ceo@c.com", "", "", "Cy Doe | CEO | | ceo@c.com"],
+            ["A", "https://a.com", "", "https://www.linkedin.com/company/a",
+             "Ann", "Lee", "Founder [unverified]", "", "https://www.linkedin.com/in/annlee"],
+            ["A", "https://a.com", "info@a.com", "https://www.linkedin.com/company/a", "", "", "", "", ""],
+            ["B", "https://b.com", "info@b.com", "", "", "", "", "", ""],
+            ["C", "https://c.com", "", "", "Cy", "Doe", "CEO", "ceo@c.com", ""],
         ]
         pd.DataFrame(rows, columns=self.HEAD).to_csv(out, index=False, quoting=1)
         return out
@@ -733,25 +840,23 @@ class TestRerunGeneric:
         m.rerun_generic()
         return analysed
 
-    def test_parse_people_round_trips_format_person(self):
-        people = [m.Person("Ann Lee", "Founder", "ann@a.com", "https://www.linkedin.com/in/ann", True), m.Person("Bo Ek", "CTO")]
-        text = "; ".join(m.format_person(p) for p in people)
-        assert m.parse_people(text) == people
-
     def test_finds_decision_maker_email_and_keeps_linkedin(self, csv_file, monkeypatch):
         decision = m.LLMDecision(decision_makers=[dm("Ann Lee", "Founder", "ann@a.com")])
         analysed = self.run(monkeypatch, {"A": decision, "B": m.LLMDecision()})
         assert analysed == ["A", "B"]                       # C already has a decision-maker email
         df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
-        row = df[df.company_name == "A"].iloc[0]
-        assert row.decision_maker_emails == "ann@a.com" and row.contact_emails == "info@a.com"
-        assert "https://www.linkedin.com/in/annlee" in row.decision_makers      # earlier LinkedIn link survives
-        assert row.company_url == "https://a.com" and row.company_linkedin.endswith("/company/a")
+        a_rows = df[df.company_name == "A"]
+        dm_row = a_rows[a_rows.first_name == "Ann"].iloc[0]
+        assert dm_row.decision_maker_email == "ann@a.com"
+        assert dm_row.contact_linkedin == "https://www.linkedin.com/in/annlee"      # earlier LinkedIn link survives
+        assert "info@a.com" in set(a_rows[a_rows.first_name == ""].company_email)
+        assert a_rows.iloc[0].company_url == "https://a.com" and a_rows.iloc[0].company_linkedin.endswith("/company/a")
 
     def test_untouched_rows_stay_as_they_were(self, csv_file, monkeypatch):
         self.run(monkeypatch, {"A": m.LLMDecision(), "B": m.LLMDecision()})
         df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
-        assert df[df.company_name == "C"].iloc[0].decision_makers == "Cy Doe | CEO | | ceo@c.com"
+        c_row = df[df.company_name == "C"].iloc[0]
+        assert c_row.first_name == "Cy" and c_row.last_name == "Doe" and c_row.decision_maker_email == "ceo@c.com"
 
     def test_stops_when_quota_runs_out_and_resumes_later(self, csv_file, tmp_path, monkeypatch):
         quota = TestRerunGeneric.quota_error()

@@ -31,6 +31,7 @@ class FakeResponse:
 def isolate(monkeypatch):
     """No real network, search or sleeping in any test."""
     m.robots_cache.clear()
+    m._existing_groups_cache = None
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     # A real browser must never start from a test; tests of the fallback
     # switch it on explicitly together with a fake Playwright.

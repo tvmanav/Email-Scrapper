@@ -1466,6 +1466,12 @@ def _analyze_with_llm(company: Company, pages: List[PageData]) -> LLMDecision:
 GENERIC_EMAIL_PREFIXES = (
     "administratie@", "receptie@", "info@", "contact@", "hello@", "office@", "enquiries@", "enquiry@",
     "sales@", "business@", "support@", "admin@",
+    # Department/role mailboxes - shared by whoever staffs them, never one
+    # specific person's own address even when a model attributes one to a
+    # named decision maker (e.g. "hr@acme.com" tagged as the CEO's email).
+    "hr@", "careers@", "jobs@", "recruiting@", "recruitment@", "press@", "media@", "marketing@",
+    "legal@", "privacy@", "billing@", "accounts@", "finance@", "noreply@", "no-reply@", "team@",
+    "help@", "webmaster@", "postmaster@",
 )
 
 
@@ -1517,6 +1523,10 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
 
     decision_makers = []
     seen = set()
+    # A shared company mailbox the model attributed to a specific person is
+    # never that person's own email, even though it is a real address found
+    # on the site - keep it as a company-level contact instead of losing it.
+    rejected_generic_emails = set()
 
     for person in result.decision_makers:
         name = person.name.strip()
@@ -1531,15 +1541,20 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
         email = normalize_email(person.email)
         if email not in website_emails:
             email = ""
+        elif email.startswith(GENERIC_EMAIL_PREFIXES):
+            rejected_generic_emails.add(email)
+            email = ""
 
         decision_makers.append(DecisionMaker(name=name, title=clean_title(person.title), email=email))
 
     decision_makers.sort(key=lambda person: role_rank(person.title))
     decision_makers = decision_makers[:MAX_DECISION_MAKERS]
 
-    # If any decision maker has an email, ignore fallback contact emails.
+    # If any decision maker has an email, ignore fallback contact emails -
+    # but a generic mailbox rejected above still deserves to surface as the
+    # company's own contact address.
     if any(person.email for person in decision_makers):
-        return LLMDecision(decision_makers=decision_makers, contact_emails=[])
+        return LLMDecision(decision_makers=decision_makers, contact_emails=sorted(rejected_generic_emails))
 
     # Otherwise fall back to contact emails. Trust the LLM's picks as long
     # as the exact email genuinely appears on the website - don't
@@ -1549,7 +1564,7 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
     contact_emails = {
         normalize_email(email) for email in result.contact_emails
         if normalize_email(email) in website_emails
-    }
+    } | rejected_generic_emails
 
     # If the LLM found nothing, fall back to a generic-prefix heuristic
     # over the emails actually extracted from the site.
@@ -1885,8 +1900,8 @@ def attach_site_emails(people: List[Person], pages: List[PageData], company: Com
 # ============================================================
 
 OUTPUT_COLUMNS = [
-    "company_name", "company_url", "decision_maker_emails", "contact_emails",
-    "company_linkedin", "decision_makers",
+    "company_name", "company_url", "company_email", "company_linkedin",
+    "first_name", "last_name", "contact_title", "decision_maker_email", "contact_linkedin",
 ]
 
 
@@ -1901,6 +1916,23 @@ def sanitize_csv_field(value: str) -> str:
     return "'" + value if value[:1] in CSV_FORMULA_PREFIXES else value
 
 
+def split_name(name: str) -> tuple:
+    """(first_name, last_name), splitting at the first space. last_name is
+    everything after it, not just the final word, so a middle name is never
+    silently dropped - first_name + " " + last_name reconstructs the
+    original exactly. Empty last_name for a single-word name."""
+    name = (name or "").strip()
+    if not name:
+        return "", ""
+    first, _, rest = name.partition(" ")
+    return first, rest.strip()
+
+
+def join_name(first_name: str, last_name: str) -> str:
+    """Inverse of split_name()."""
+    return " ".join(part for part in (first_name, last_name) if part)
+
+
 def empty_result(company: Company) -> dict:
     row = {column: "" for column in OUTPUT_COLUMNS} | {
         "company_name": company.name,
@@ -1909,32 +1941,46 @@ def empty_result(company: Company) -> dict:
     return {column: sanitize_csv_field(value) for column, value in row.items()}
 
 
-def format_person(person: Person) -> str:
-    title = f"{person.title} [unverified]" if person.unverified else person.title
-    fields = [person.name, title, person.linkedin_url, person.email]
+def build_rows(company: Company, people: List[Person], contact_emails: list, company_linkedin: str) -> List[dict]:
+    """
+    One row per contact - a named decision maker, or (when there's no named
+    person) one row per generic mailbox address - instead of packing every
+    contact for a company into one semicolon-joined cell. A company with no
+    contact at all still gets a single placeholder row so it isn't dropped
+    from the sheet.
+    """
+    base = {"company_name": company.name, "company_url": company.url, "company_linkedin": company_linkedin}
 
-    return " | ".join(field.replace(";", ",").replace("|", "/") for field in fields)
+    rows = []
+    for person in people:
+        first_name, last_name = split_name(person.name)
+        rows.append(base | {
+            "first_name": first_name,
+            "last_name": last_name,
+            "contact_title": f"{person.title} [unverified]" if person.unverified else person.title,
+            "contact_linkedin": person.linkedin_url,
+            "decision_maker_email": person.email,
+            "company_email": "",
+        })
+    rows += [
+        base | {"first_name": "", "last_name": "", "contact_title": "", "contact_linkedin": "",
+                "decision_maker_email": "", "company_email": email}
+        for email in sorted(set(contact_emails))
+    ]
+    if not rows:
+        rows = [base | {"first_name": "", "last_name": "", "contact_title": "", "contact_linkedin": "",
+                         "decision_maker_email": "", "company_email": ""}]
 
-
-def build_row(company: Company, decision_maker_emails: list, contact_emails: list,
-              company_linkedin: str, people: List[Person]) -> dict:
-    row = {
-        "company_name": company.name,
-        "company_url": company.url,
-        "decision_maker_emails": ";".join(decision_maker_emails),
-        "contact_emails": ";".join(sorted(set(contact_emails))),
-        "company_linkedin": company_linkedin,
-        # Each person is "Name | Title | LinkedIn | Email"; people are joined by "; ".
-        "decision_makers": "; ".join(format_person(person) for person in people),
-    }
-    return {column: sanitize_csv_field(value) for column, value in row.items()}
+    return [{column: sanitize_csv_field(row.get(column, "")) for column in OUTPUT_COLUMNS} for row in rows]
 
 
 def linkedin_incomplete(company_linkedin: str, people: List[Person]) -> bool:
     return not company_linkedin or not people or any(not person.linkedin_url for person in people)
 
 
-def process_company(company: Company, retry_queue: list) -> dict:
+def process_company(company: Company, retry_queue: list) -> List[dict]:
+    """Returns this company's contact rows: one per decision maker/generic
+    address found, or a single placeholder row when nothing was."""
     try:
         pages = crawl_company(company)
 
@@ -1943,7 +1989,7 @@ def process_company(company: Company, retry_queue: list) -> dict:
             # Timeouts are often temporary (slow host, busy network): queue a
             # full second attempt. pages=None marks "crawl again from scratch".
             retry_queue.append((company, None, None, "", []))
-            return empty_result(company)
+            return [empty_result(company)]
 
         try:
             llm_result = analyze_with_llm(company, pages)
@@ -1961,10 +2007,22 @@ def process_company(company: Company, retry_queue: list) -> dict:
         if not decision_maker_emails and not contact_emails and company.directory_email:
             contact_emails = [company.directory_email]
 
-        # LinkedIn is only the fallback: skip the lookup when the website
-        # already gave us a decision maker's email.
+        # LinkedIn is only the fallback: skip the (quota-limited) per-person
+        # search when the website already gave us a decision maker's email -
+        # but still keep their name/title, already validated against the
+        # site, rather than leaving the row with an email and no attached
+        # person. The company's own LinkedIn page is still worth finding:
+        # find_company_linkedin() checks the source directory and the
+        # already-crawled pages for free before ever spending search budget,
+        # so skipping it entirely here would throw away free data.
         company_linkedin, people = "", []
-        if not decision_maker_emails:
+        if decision_maker_emails:
+            people = [Person(name=dm.name, title=dm.title, email=dm.email) for dm in validated.decision_makers]
+            try:
+                company_linkedin = find_company_linkedin(company, pages, SearchBudget(LINKEDIN_MAX_SEARCHES_PER_COMPANY))
+            except Exception:
+                logger.exception("Company LinkedIn lookup failed: %s", company.name)
+        else:
             try:
                 company_linkedin, people = enrich_linkedin(company, pages, validated)
             except Exception:
@@ -1980,11 +2038,11 @@ def process_company(company: Company, retry_queue: list) -> dict:
                 # Keep the crawl and LLM result so the retry only repeats the searches.
                 retry_queue.append((company, pages, validated, company_linkedin, people))
 
-        return build_row(company, decision_maker_emails, contact_emails, company_linkedin, people)
+        return build_rows(company, people, contact_emails, company_linkedin)
 
     except Exception:
         logger.exception("Company failed: %s", company.name)
-        return empty_result(company)
+        return [empty_result(company)]
 
 
 def merge_people(old: List[Person], new: List[Person]) -> List[Person]:
@@ -2004,6 +2062,11 @@ def merge_people(old: List[Person], new: List[Person]) -> List[Person]:
 results_lock = threading.Lock()  # guards result rows and the CSV file
 
 
+def flatten(groups) -> list:
+    """Company row-groups (some possibly None/empty) into one flat list of rows."""
+    return [row for group in groups if group for row in group]
+
+
 def recrawl_company(company: Company, rows_by_url: dict, results: list):
     """Second attempt for a company whose first crawl found no pages at all."""
     try:
@@ -2012,15 +2075,19 @@ def recrawl_company(company: Company, rows_by_url: dict, results: list):
         logger.exception("Second crawl failed: %s", company.name)
         return
 
-    has_data = any(fresh[column] for column in ("decision_maker_emails", "contact_emails", "company_linkedin", "decision_makers"))
+    has_data = any(
+        any(row.get(column) for column in
+            ("first_name", "decision_maker_email", "company_email", "contact_linkedin", "company_linkedin"))
+        for row in fresh
+    )
 
     try:
         with results_lock:
-            row = rows_by_url.get(company.url)
-            if row is not None and has_data:
+            group = rows_by_url.get(company.url)
+            if group is not None and has_data:
                 logger.info("Second crawl recovered: %s", company.name)
-                row.update(fresh)
-                save_results(results)
+                group[:] = fresh
+                save_results(flatten(results))
     except Exception:
         logger.exception("Second crawl merge failed: %s", company.name)
 
@@ -2044,34 +2111,33 @@ def retry_company(item: tuple, rows_by_url: dict, results: list):
     # already scraped in this chunk, not just this one).
     try:
         people = merge_people(old_people, new_people)
-        added = attach_site_emails(people, pages, company)
+        attach_site_emails(people, pages, company)
 
         with results_lock:
-            row = rows_by_url.get(company.url)
-            if row is None:
+            group = rows_by_url.get(company.url)
+            if group is None:
                 return
 
-            dm_emails = sorted({e for e in row["decision_maker_emails"].split(";") if e} | set(added))
-            row.update(build_row(
-                company,
-                dm_emails,
-                [e for e in row["contact_emails"].split(";") if e and e not in dm_emails],
-                old_linkedin or new_linkedin,
-                people,
-            ))
-            save_results(results)
+            dm_emails = {p.email for p in people if p.email}
+            generic_emails = [
+                row["company_email"] for row in group
+                if row.get("company_email") and row["company_email"] not in dm_emails
+            ]
+            group[:] = build_rows(company, people, generic_emails, old_linkedin or new_linkedin)
+            save_results(flatten(results))
     except Exception:
         logger.exception("Second pass merge failed: %s", company.name)
 
 
 def second_pass(retry_queue: list, results: list):
+    """`results` is run_companies()'s return value: one row-group per company."""
     logger.info(
         "Second pass: retrying %d companies (failed crawls and missing LinkedIn data) after %ds cool-down",
         len(retry_queue), SECOND_PASS_COOLDOWN_SECONDS,
     )
     time.sleep(SECOND_PASS_COOLDOWN_SECONDS)
 
-    rows_by_url = {row["company_url"]: row for row in results}
+    rows_by_url = {group[0]["company_url"]: group for group in results if group}
 
     with ThreadPoolExecutor(max_workers=max(1, COMPANY_WORKERS)) as pool:
         list(pool.map(lambda item: retry_company(item, rows_by_url, results), retry_queue))
@@ -2079,78 +2145,158 @@ def second_pass(retry_queue: list, results: list):
 
 _suppress_saves = False  # chunked mode appends rows itself instead of rewriting the CSV
 
+# (OUTPUT_FILE, mtime) -> the groups we last loaded/wrote for it. save_results()
+# is called once per company in a tight loop (see run_companies), and without
+# this, each call did a full pd.read_csv + reparse of the whole shared file -
+# an O(file_size) cost paid on every single company, growing quadratically
+# over an N-company run as the file accumulates rows across sessions. The
+# mtime check means any external change (a different process, a manual edit)
+# still forces a fresh read, so this can never serve stale data.
+_existing_groups_cache: Optional[tuple] = None
 
-def load_existing_rows() -> dict:
-    """domain -> row already on file, so a save merges into it instead of
-    discarding whatever another run or another source already put there.
-    Keyed by domain (not the raw company_url string) for the same reason
-    run_chunked's own resume check uses get_domain(): a "www." prefix or a
-    different URL path for the same company must still match, the way
+
+def load_existing_groups() -> dict:
+    """domain -> that company's rows already on file, so a save merges into
+    them instead of discarding whatever another run or source already put
+    there. Keyed by domain (not the raw company_url string) for the same
+    reason run_chunked's own resume check uses get_domain(): a "www." prefix
+    or a different URL path for the same company must still match, the way
     extract_clutch_companies/extract_zakelijkeregister_companies already
     dedupe companies elsewhere in this file."""
+    global _existing_groups_cache
+
     if not os.path.exists(OUTPUT_FILE):
         return {}
+
+    mtime = os.path.getmtime(OUTPUT_FILE)
+    if _existing_groups_cache is not None:
+        cached_path, cached_mtime, cached_groups = _existing_groups_cache
+        if cached_path == OUTPUT_FILE and cached_mtime == mtime:
+            return cached_groups
+
     try:
         df = pd.read_csv(OUTPUT_FILE, dtype=str, keep_default_na=False)
     except pd.errors.EmptyDataError:
         return {}
-    return {get_domain(row["company_url"]): row for row in df.to_dict("records")}
+
+    groups: dict = {}
+    for row in df.to_dict("records"):
+        groups.setdefault(get_domain(row["company_url"]), []).append(row)
+    return groups
 
 
 def merge_people_union(old: List[Person], new: List[Person]) -> List[Person]:
     """Combines two decision-maker lists for the same company, matched by
-    name: each side fills in whatever the other is missing, and a name found
-    on only one side is kept rather than dropped."""
-    merged: dict = {}
+    name - or by email when a name is missing, which happens for a
+    decision-maker email found directly on a site with no person attached
+    (see process_company). An email-only entry must never be silently
+    dropped just because it has no name to key on (alnum("") is falsy), and
+    must be upgraded in place rather than duplicated once a later pass does
+    attach a name to that same email. Each side fills in whatever the other
+    is missing, and a person found on only one side is kept rather than
+    dropped."""
+    by_key: dict = {}
+    by_email: dict = {}
     order: list = []
+
     for person in old + new:
-        key = alnum(person.name)
-        if not key:
+        name_key = alnum(person.name)
+        if not name_key and not person.email:
             continue
-        existing = merged.get(key)
+
+        existing = by_key.get(name_key) if name_key else None
+        if existing is None and person.email:
+            existing = by_email.get(person.email)
+
         if existing is None:
-            merged[key] = Person(person.name, person.title, person.email, person.linkedin_url, person.unverified)
-            order.append(key)
+            copy = Person(person.name, person.title, person.email, person.linkedin_url, person.unverified)
+            by_key[name_key or f"email:{person.email}"] = copy
+            order.append(name_key or f"email:{person.email}")
+            if copy.email:
+                by_email[copy.email] = copy
             continue
+
         existing.title = existing.title or person.title
         existing.email = existing.email or person.email
         existing.linkedin_url = existing.linkedin_url or person.linkedin_url
         existing.unverified = existing.unverified and person.unverified
-    return [merged[key] for key in order]
+        if not alnum(existing.name) and person.name:
+            existing.name = person.name
+        if existing.email:
+            by_email[existing.email] = existing
+
+    return [by_key[key] for key in order]
 
 
-def merge_row(old: Optional[dict], new: dict) -> dict:
-    """Upserts a freshly scraped row onto whatever is already on file for
-    this company: email sets are unioned, decision makers merged by name,
-    and the first non-empty value wins for everything else - so a weaker
-    rerun (site down, LLM quota spent) can never erase data an earlier run
-    already found, but anything genuinely new still gets added."""
-    if not old:
-        return new
+def rows_to_contacts(rows: List[dict]) -> tuple:
+    """Rebuilds (people, generic_emails, company_linkedin) from a company's
+    already-saved rows - the inverse of build_rows(). Must strip the
+    "[unverified]" suffix build_rows appends to contact_title back off (and
+    restore the flag it came from), or a row that round-trips through here
+    would bake the literal text into the title and silently lose the flag."""
+    people, generic_emails, company_linkedin = [], [], ""
+    for row in rows:
+        company_linkedin = company_linkedin or row.get("company_linkedin", "")
+        # A row can be a decision-maker with no name on file yet (an email
+        # found directly with nobody attached) - checking decision_maker_email
+        # too keeps that row from falling through both branches and vanishing.
+        if row.get("first_name") or row.get("last_name") or row.get("decision_maker_email"):
+            title = row.get("contact_title", "")
+            unverified = title.endswith(" [unverified]")
+            people.append(Person(
+                name=join_name(row.get("first_name", ""), row.get("last_name", "")),
+                title=title.removesuffix(" [unverified]") if unverified else title,
+                email=row.get("decision_maker_email", ""), linkedin_url=row.get("contact_linkedin", ""),
+                unverified=unverified,
+            ))
+        elif row.get("company_email"):
+            generic_emails.append(row["company_email"])
+    return people, generic_emails, company_linkedin
 
-    dm_emails = sorted({e for e in f"{old['decision_maker_emails']};{new['decision_maker_emails']}".split(";") if e})
-    contact_emails = sorted({
-        e for e in f"{old['contact_emails']};{new['contact_emails']}".split(";")
-        if e and e not in dm_emails
-    })
-    people = merge_people_union(parse_people(old.get("decision_makers", "")), parse_people(new.get("decision_makers", "")))
-    company = Company(name=new["company_name"] or old.get("company_name", ""), url=new["company_url"])
-    company_linkedin = new.get("company_linkedin") or old.get("company_linkedin", "")
 
-    return build_row(company, dm_emails, contact_emails, company_linkedin, people)
+def merge_group(old_rows: Optional[List[dict]], new_rows: List[dict]) -> List[dict]:
+    """Upserts a freshly scraped company's rows onto whatever is already on
+    file for it: people merged by name, generic emails unioned, and the
+    first non-empty company_linkedin wins - so a weaker rerun (site down,
+    LLM quota spent) can never erase a contact an earlier run already
+    found, but anything genuinely new still gets added."""
+    if not old_rows:
+        return new_rows
+
+    old_people, old_generic, old_linkedin = rows_to_contacts(old_rows)
+    new_people, new_generic, new_linkedin = rows_to_contacts(new_rows)
+
+    people = merge_people_union(old_people, new_people)
+    dm_emails = {p.email for p in people if p.email}
+    generic_emails = sorted((set(old_generic) | set(new_generic)) - dm_emails)
+    company_linkedin = new_linkedin or old_linkedin
+    company = Company(
+        name=new_rows[0].get("company_name") or old_rows[0].get("company_name", ""),
+        url=new_rows[0]["company_url"],
+    )
+
+    return build_rows(company, people, generic_emails, company_linkedin)
 
 
 def save_results(results: list):
+    """`results` is a flat list of contact rows (possibly several per
+    company); each save merges them onto whatever's already on OUTPUT_FILE."""
+    global _existing_groups_cache
+
     if _suppress_saves:
         return
 
-    existing = load_existing_rows()
-    touched = {get_domain(row["company_url"]) for row in results}
-    merged = {domain: row for domain, row in existing.items() if domain not in touched}
+    new_groups: dict = {}
     for row in results:
-        merged[get_domain(row["company_url"])] = merge_row(existing.get(get_domain(row["company_url"])), row)
+        new_groups.setdefault(get_domain(row["company_url"]), []).append(row)
 
-    pd.DataFrame(list(merged.values()), columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
+    existing = load_existing_groups()
+    merged = {domain: rows for domain, rows in existing.items() if domain not in new_groups}
+    for domain, rows in new_groups.items():
+        merged[domain] = merge_group(existing.get(domain), rows)
+
+    pd.DataFrame(flatten(merged.values()), columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
+    _existing_groups_cache = (OUTPUT_FILE, os.path.getmtime(OUTPUT_FILE), merged)
     logger.info("Saved: %s", OUTPUT_FILE)
 
 
@@ -2159,58 +2305,39 @@ def save_results(results: list):
 # ============================================================
 
 def run_companies(companies: List[Company], retry_queue: list) -> list:
-    """Processes companies in parallel; rows come back in the original order."""
+    """Processes companies in parallel; each entry is that company's list of
+    contact rows (always at least one), in the original company order."""
     rows = [None] * len(companies)
 
     def work(index: int):
         logger.info("[%d/%d] %s", index + 1, len(companies), companies[index].name)
 
-        row = process_company(companies[index], retry_queue)
+        group = process_company(companies[index], retry_queue)
 
         with results_lock:
-            rows[index] = row
-            save_results([r for r in rows if r is not None])  # progress survives a crash
+            rows[index] = group
+            save_results(flatten(rows))  # progress survives a crash
 
     with ThreadPoolExecutor(max_workers=max(1, COMPANY_WORKERS)) as pool:
         list(pool.map(work, range(len(companies))))
 
-    return [row for row in rows if row is not None]
+    return [group for group in rows if group is not None]
 
 
-def parse_people(field: str) -> List[Person]:
-    """Inverse of format_person: "Name | Title | LinkedIn | Email" entries joined by "; "."""
-    people = []
-    for entry in field.split("; "):
-        parts = [part.strip() for part in entry.split(" | ")]
-        if len(parts) < 2 or not parts[0]:
-            continue
-        title = parts[1]
-        unverified = title.endswith(" [unverified]")
-        people.append(Person(
-            name=parts[0],
-            title=title.removesuffix(" [unverified]"),
-            linkedin_url=parts[2] if len(parts) > 2 else "",
-            email=parts[3] if len(parts) > 3 else "",
-            unverified=unverified,
-        ))
-
-    return people
-
-
-def rerun_row(row: dict) -> Optional[dict]:
+def rerun_company(company: Company, old_rows: List[dict]) -> Optional[List[dict]]:
     """
-    Re-crawls one row's site and asks the LLM for its decision makers.
-    Returns the updated row, or None when the crawl failed (nothing was
-    learned, so the row stays eligible). Lets RateLimitError through.
+    Re-crawls one company's site and asks the LLM for its decision makers.
+    Returns the company's updated rows, or None when the crawl failed
+    (nothing was learned, so it stays eligible for a later run). Lets
+    RateLimitError through.
     """
-    company = Company(name=row["company_name"], url=row["company_url"])
     pages = crawl_company(Company(name=company.name, url=company.url))
     if not pages:
         return None
 
     validated = validate_result(analyze_with_llm(company, pages), pages)
 
-    old_people = parse_people(row["decision_makers"])
+    old_people, old_generic, old_linkedin = rows_to_contacts(old_rows)
     old_by_name = {alnum(person.name): person for person in old_people}
     people = []
     for dm in validated.decision_makers:
@@ -2224,48 +2351,65 @@ def rerun_row(row: dict) -> Optional[dict]:
 
     attach_site_emails(people, pages, company)
 
-    dm_emails = sorted({e for e in row["decision_maker_emails"].split(";") if e} | {p.email for p in people if p.email})
-    contacts = [e for e in row["contact_emails"].split(";") if e and e not in dm_emails]
+    dm_emails = {p.email for p in people if p.email}
+    generic_emails = [e for e in old_generic if e not in dm_emails]
 
-    return build_row(company, dm_emails, contacts, row["company_linkedin"], people)
+    return build_rows(company, people, generic_emails, old_linkedin)
 
 
 def rerun_generic():
-    """Gives rows with only generic mailboxes an LLM pass, until the daily quota runs out."""
+    """Gives companies with only generic mailboxes an LLM pass, until the daily quota runs out."""
     rows = pd.read_csv(OUTPUT_FILE, dtype=str, keep_default_na=False).to_dict("records")
+
+    groups: dict = {}
+    order: list = []
+    for row in rows:
+        domain = get_domain(row["company_url"])
+        if domain not in groups:
+            groups[domain] = []
+            order.append(domain)
+        groups[domain].append(row)
+
+    def has_dm_email(domain):
+        return any(row.get("decision_maker_email") for row in groups[domain])
+
     done = read_lines(RERUN_DONE_FILE)
-    todo = [row for row in rows if not row["decision_maker_emails"] and row["company_url"] not in done]
-    logger.info("%d rows have no decision-maker email, %d not yet re-analysed", sum(1 for r in rows if not r["decision_maker_emails"]), len(todo))
+    no_dm_email = [domain for domain in order if not has_dm_email(domain)]
+    todo = [domain for domain in no_dm_email if groups[domain][0]["company_url"] not in done]
+    logger.info("%d companies have no decision-maker email, %d not yet re-analysed", len(no_dm_email), len(todo))
 
     processed = improved = 0
 
-    for row in todo:
+    for domain in todo:
         if 0 < RERUN_MAX <= processed:
             break
 
+        old_rows = groups[domain]
+        company = Company(name=old_rows[0]["company_name"], url=old_rows[0]["company_url"])
+
         try:
-            updated = rerun_row(row)
+            updated = rerun_company(company, old_rows)
         except RateLimitError:
             logger.warning("Groq quota used up after %d companies; run again later to continue.", processed)
             break
         except Exception:
-            logger.exception("Re-analysis failed: %s", row["company_name"])
+            logger.exception("Re-analysis failed: %s", company.name)
             continue
 
         if updated is None:
-            logger.warning("No pages found, left for a later run: %s", row["company_name"])
+            logger.warning("No pages found, left for a later run: %s", company.name)
             continue
 
-        updated["company_url"] = row["company_url"]
         processed += 1
-        if updated["decision_maker_emails"]:
+        found_emails = [row["decision_maker_email"] for row in updated if row["decision_maker_email"]]
+        if found_emails:
             improved += 1
-        row.update(updated)
+        groups[domain] = updated
 
         with open(RERUN_DONE_FILE, "a") as f:
-            f.write(row["company_url"] + "\n")
-        pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
-        logger.info("[%d] %s -> %s", processed, row["company_name"], updated["decision_maker_emails"] or "no decision-maker email")
+            f.write(company.url + "\n")
+        pd.DataFrame(flatten(groups[d] for d in order), columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
+        logger.info("[%d] %s -> %s", processed, company.name, ";".join(found_emails) or "no decision-maker email")
 
     logger.info("Re-analysed %d companies, %d now have a decision-maker email.", processed, improved)
 
@@ -2441,7 +2585,7 @@ def run_chunked(companies: List[Company]):
             _suppress_saves = False
 
         if rows:
-            pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(
+            pd.DataFrame(flatten(rows), columns=OUTPUT_COLUMNS).to_csv(
                 OUTPUT_FILE, mode="a", header=not os.path.exists(OUTPUT_FILE), index=False, quoting=csv.QUOTE_ALL
             )
         logger.info("Chunk saved: %d/%d companies done", len(done) + start + len(chunk), len(companies))

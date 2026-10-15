@@ -141,6 +141,18 @@ class TestValidateResult:
         out = m.validate_result(m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "made.up@acme.com")]), self.PAGES)
         assert out.decision_makers[0].email == ""
 
+    def test_generic_mailbox_rejected_as_a_persons_email_but_kept_as_contact(self):
+        out = m.validate_result(m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "info@acme.com")]), self.PAGES)
+        assert out.decision_makers[0].name == "Jane Doe" and out.decision_makers[0].email == ""
+        assert out.contact_emails == ["info@acme.com"]  # not lost, just not attributed to her personally
+
+    def test_generic_mailbox_still_surfaces_when_another_dm_has_a_real_email(self):
+        res = m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "jane@acme.com"), dm("John Roe", "CTO", "info@acme.com")])
+        out = m.validate_result(res, self.PAGES)
+        emails = {p.name: p.email for p in out.decision_makers}
+        assert emails["Jane Doe"] == "jane@acme.com" and emails["John Roe"] == ""
+        assert out.contact_emails == ["info@acme.com"]
+
     def test_invented_person_dropped(self):
         out = m.validate_result(m.LLMDecision(decision_makers=[dm("Ghost Person", "CEO", "jane@acme.com")]), self.PAGES)
         assert out.decision_makers == []
