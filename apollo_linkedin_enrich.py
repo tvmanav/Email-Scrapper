@@ -2,7 +2,7 @@
 Fills in missing decision-maker emails by opening each person's LinkedIn
 profile in a dedicated, project-local Chrome profile (so Apollo/Kendo/SalesQL
 stay installed and logged in between runs) and reading whatever email the
-extension reveals. Tries Apollo first, then Kendo, then SalesQL.
+extension reveals. Tries Apollo first, then SalesQL, then Kendo.
 
 Selectors for each extension are best-effort guesses: this was written
 without live access to the extensions' DOM. When an extraction fails, the
@@ -79,7 +79,7 @@ PACE_SECONDS = float(os.getenv("APOLLO_PACE_SECONDS", "4"))
 NAV_TIMEOUT_MS = 20_000
 WAIT_AFTER_LOAD_MS = 4_000
 
-EXTENSION_ORDER = ("apollo", "kendo", "salesql")
+EXTENSION_ORDER = ("apollo", "salesql", "kendo")
 
 
 class CreditsExhausted(Exception):
