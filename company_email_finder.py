@@ -912,7 +912,11 @@ def parse_zr_profile(name: str, html: str) -> Optional[Company]:
 
     website = normalize_url(website)
     domain = get_domain(website)
-    if not domain or domain.endswith(NON_COMPANY_SITE_DOMAINS):
+    # A plain .endswith() on these suffixes would also match a real company
+    # whose domain merely ends in the same letters (fedex.com, netflix.com
+    # and relax.com all end in "x.com") - require an exact domain or a
+    # subdomain of it, the same rule domain_matches() uses everywhere else.
+    if not domain or any(domain == d or domain.endswith("." + d) for d in NON_COMPANY_SITE_DOMAINS):
         return None
 
     linkedin = ""
@@ -2010,12 +2014,15 @@ def recrawl_company(company: Company, rows_by_url: dict, results: list):
 
     has_data = any(fresh[column] for column in ("decision_maker_emails", "contact_emails", "company_linkedin", "decision_makers"))
 
-    with results_lock:
-        row = rows_by_url.get(company.url)
-        if row is not None and has_data:
-            logger.info("Second crawl recovered: %s", company.name)
-            row.update(fresh)
-            save_results(results)
+    try:
+        with results_lock:
+            row = rows_by_url.get(company.url)
+            if row is not None and has_data:
+                logger.info("Second crawl recovered: %s", company.name)
+                row.update(fresh)
+                save_results(results)
+    except Exception:
+        logger.exception("Second crawl merge failed: %s", company.name)
 
 
 def retry_company(item: tuple, rows_by_url: dict, results: list):
@@ -2031,23 +2038,30 @@ def retry_company(item: tuple, rows_by_url: dict, results: list):
         logger.exception("Second pass failed: %s", company.name)
         return
 
-    people = merge_people(old_people, new_people)
-    added = attach_site_emails(people, pages, company)
+    # A failure merging this one company's result must not take the rest of
+    # the chunk down with it (an uncaught exception here would propagate out
+    # of second_pass and skip run_chunked's CSV write, losing every company
+    # already scraped in this chunk, not just this one).
+    try:
+        people = merge_people(old_people, new_people)
+        added = attach_site_emails(people, pages, company)
 
-    with results_lock:
-        row = rows_by_url.get(company.url)
-        if row is None:
-            return
+        with results_lock:
+            row = rows_by_url.get(company.url)
+            if row is None:
+                return
 
-        dm_emails = sorted({e for e in row["decision_maker_emails"].split(";") if e} | set(added))
-        row.update(build_row(
-            company,
-            dm_emails,
-            [e for e in row["contact_emails"].split(";") if e and e not in dm_emails],
-            old_linkedin or new_linkedin,
-            people,
-        ))
-        save_results(results)
+            dm_emails = sorted({e for e in row["decision_maker_emails"].split(";") if e} | set(added))
+            row.update(build_row(
+                company,
+                dm_emails,
+                [e for e in row["contact_emails"].split(";") if e and e not in dm_emails],
+                old_linkedin or new_linkedin,
+                people,
+            ))
+            save_results(results)
+    except Exception:
+        logger.exception("Second pass merge failed: %s", company.name)
 
 
 def second_pass(retry_queue: list, results: list):
@@ -2066,11 +2080,77 @@ def second_pass(retry_queue: list, results: list):
 _suppress_saves = False  # chunked mode appends rows itself instead of rewriting the CSV
 
 
+def load_existing_rows() -> dict:
+    """domain -> row already on file, so a save merges into it instead of
+    discarding whatever another run or another source already put there.
+    Keyed by domain (not the raw company_url string) for the same reason
+    run_chunked's own resume check uses get_domain(): a "www." prefix or a
+    different URL path for the same company must still match, the way
+    extract_clutch_companies/extract_zakelijkeregister_companies already
+    dedupe companies elsewhere in this file."""
+    if not os.path.exists(OUTPUT_FILE):
+        return {}
+    try:
+        df = pd.read_csv(OUTPUT_FILE, dtype=str, keep_default_na=False)
+    except pd.errors.EmptyDataError:
+        return {}
+    return {get_domain(row["company_url"]): row for row in df.to_dict("records")}
+
+
+def merge_people_union(old: List[Person], new: List[Person]) -> List[Person]:
+    """Combines two decision-maker lists for the same company, matched by
+    name: each side fills in whatever the other is missing, and a name found
+    on only one side is kept rather than dropped."""
+    merged: dict = {}
+    order: list = []
+    for person in old + new:
+        key = alnum(person.name)
+        if not key:
+            continue
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = Person(person.name, person.title, person.email, person.linkedin_url, person.unverified)
+            order.append(key)
+            continue
+        existing.title = existing.title or person.title
+        existing.email = existing.email or person.email
+        existing.linkedin_url = existing.linkedin_url or person.linkedin_url
+        existing.unverified = existing.unverified and person.unverified
+    return [merged[key] for key in order]
+
+
+def merge_row(old: Optional[dict], new: dict) -> dict:
+    """Upserts a freshly scraped row onto whatever is already on file for
+    this company: email sets are unioned, decision makers merged by name,
+    and the first non-empty value wins for everything else - so a weaker
+    rerun (site down, LLM quota spent) can never erase data an earlier run
+    already found, but anything genuinely new still gets added."""
+    if not old:
+        return new
+
+    dm_emails = sorted({e for e in f"{old['decision_maker_emails']};{new['decision_maker_emails']}".split(";") if e})
+    contact_emails = sorted({
+        e for e in f"{old['contact_emails']};{new['contact_emails']}".split(";")
+        if e and e not in dm_emails
+    })
+    people = merge_people_union(parse_people(old.get("decision_makers", "")), parse_people(new.get("decision_makers", "")))
+    company = Company(name=new["company_name"] or old.get("company_name", ""), url=new["company_url"])
+    company_linkedin = new.get("company_linkedin") or old.get("company_linkedin", "")
+
+    return build_row(company, dm_emails, contact_emails, company_linkedin, people)
+
+
 def save_results(results: list):
     if _suppress_saves:
         return
 
-    pd.DataFrame(results, columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
+    existing = load_existing_rows()
+    touched = {get_domain(row["company_url"]) for row in results}
+    merged = {domain: row for domain, row in existing.items() if domain not in touched}
+    for row in results:
+        merged[get_domain(row["company_url"])] = merge_row(existing.get(get_domain(row["company_url"])), row)
+
+    pd.DataFrame(list(merged.values()), columns=OUTPUT_COLUMNS).to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
     logger.info("Saved: %s", OUTPUT_FILE)
 
 
@@ -2294,6 +2374,16 @@ def collect_clutch_country(country: str) -> bool:
 
         logger.info("%s page %d: %d companies", country, page + 1, len(found))
 
+    # The loop ran out of page budget, not out of listings: run_countries
+    # still marks this country "done" and will never revisit it, so a
+    # country with more than CLUTCH_COUNTRY_MAX_PAGES pages would silently
+    # lose everything past the cap unless this is surfaced loudly.
+    logger.warning(
+        "%s: reached CLUTCH_COUNTRY_MAX_PAGES (%d) without an empty page - "
+        "this country may have more companies than were collected. "
+        "Raise CLUTCH_COUNTRY_MAX_PAGES and rerun if so.",
+        country, CLUTCH_COUNTRY_MAX_PAGES,
+    )
     return True
 
 
@@ -2334,18 +2424,26 @@ def run_chunked(companies: List[Company]):
     for start in range(0, len(todo), CHUNK_SIZE):
         chunk = todo[start:start + CHUNK_SIZE]
         retry_queue = []
+        rows = []
 
         _suppress_saves = True
         try:
             rows = run_companies(chunk, retry_queue)
             if ENABLE_SECOND_PASS and retry_queue:
                 second_pass(retry_queue, rows)
+        except Exception:
+            # Whatever already got scraped into `rows` must still reach the
+            # CSV below even if second_pass (or something else) blew up
+            # partway through - losing an unhandled error here used to mean
+            # the whole chunk's already-found emails never got saved at all.
+            logger.exception("Chunk processing hit an error; saving what was already scraped")
         finally:
             _suppress_saves = False
 
-        pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(
-            OUTPUT_FILE, mode="a", header=not os.path.exists(OUTPUT_FILE), index=False, quoting=csv.QUOTE_ALL
-        )
+        if rows:
+            pd.DataFrame(rows, columns=OUTPUT_COLUMNS).to_csv(
+                OUTPUT_FILE, mode="a", header=not os.path.exists(OUTPUT_FILE), index=False, quoting=csv.QUOTE_ALL
+            )
         logger.info("Chunk saved: %d/%d companies done", len(done) + start + len(chunk), len(companies))
 
 
