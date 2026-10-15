@@ -1800,8 +1800,13 @@ def split_name(name: str) -> tuple:
     """(first_name, last_name), splitting at the first space. last_name is
     everything after it, not just the final word, so a middle name is never
     silently dropped - first_name + " " + last_name reconstructs the
-    original exactly. Empty last_name for a single-word name."""
-    name = (name or "").strip()
+    original exactly. Empty last_name for a single-word name.
+
+    Whitespace is normalized first: a name scraped off a page can be joined
+    by a non-breaking space (\xa0) or other unicode whitespace instead of a
+    plain " ", which str.partition(" ") would not split on, leaving the
+    whole name stuck in first_name."""
+    name = " ".join((name or "").split())
     if not name:
         return "", ""
     first, _, rest = name.partition(" ")
@@ -1811,6 +1816,18 @@ def split_name(name: str) -> tuple:
 def join_name(first_name: str, last_name: str) -> str:
     """Inverse of split_name()."""
     return " ".join(part for part in (first_name, last_name) if part)
+
+
+def join_company_emails(emails) -> str:
+    """Joins a company's generic mailbox addresses into one field, so they
+    can be repeated across every contact row like company_linkedin already
+    is, instead of each spawning its own near-empty row."""
+    return "; ".join(sorted(set(emails)))
+
+
+def split_company_email(value: str) -> List[str]:
+    """Inverse of join_company_emails()."""
+    return [email.strip() for email in (value or "").split(";") if email.strip()]
 
 
 def empty_result(company: Company) -> dict:
@@ -1823,13 +1840,19 @@ def empty_result(company: Company) -> dict:
 
 def build_rows(company: Company, people: List[Person], contact_emails: list, company_linkedin: str) -> List[dict]:
     """
-    One row per contact - a named decision maker, or (when there's no named
-    person) one row per generic mailbox address - instead of packing every
-    contact for a company into one semicolon-joined cell. A company with no
+    One row per named decision maker. The company's generic mailbox
+    address(es), if any, are joined into company_email and repeated on
+    every row - the same way company_linkedin already is - rather than each
+    one spawning its own separate, otherwise-blank row. A company with no
     contact at all still gets a single placeholder row so it isn't dropped
     from the sheet.
     """
-    base = {"company_name": company.name, "company_url": company.url, "company_linkedin": company_linkedin}
+    base = {
+        "company_name": company.name,
+        "company_url": company.url,
+        "company_linkedin": company_linkedin,
+        "company_email": join_company_emails(contact_emails),
+    }
 
     rows = []
     for person in people:
@@ -1840,16 +1863,10 @@ def build_rows(company: Company, people: List[Person], contact_emails: list, com
             "contact_title": f"{person.title} [unverified]" if person.unverified else person.title,
             "contact_linkedin": person.linkedin_url,
             "decision_maker_email": person.email,
-            "company_email": "",
         })
-    rows += [
-        base | {"first_name": "", "last_name": "", "contact_title": "", "contact_linkedin": "",
-                "decision_maker_email": "", "company_email": email}
-        for email in sorted(set(contact_emails))
-    ]
     if not rows:
         rows = [base | {"first_name": "", "last_name": "", "contact_title": "", "contact_linkedin": "",
-                         "decision_maker_email": "", "company_email": ""}]
+                         "decision_maker_email": ""}]
 
     return [{column: sanitize_csv_field(row.get(column, "")) for column in OUTPUT_COLUMNS} for row in rows]
 
@@ -1999,10 +2016,10 @@ def retry_company(item: tuple, rows_by_url: dict, results: list):
                 return
 
             dm_emails = {p.email for p in people if p.email}
-            generic_emails = [
-                row["company_email"] for row in group
-                if row.get("company_email") and row["company_email"] not in dm_emails
-            ]
+            generic_emails = sorted({
+                email for row in group for email in split_company_email(row.get("company_email", ""))
+                if email not in dm_emails
+            })
             group[:] = build_rows(company, people, generic_emails, old_linkedin or new_linkedin)
             save_results(flatten(results))
     except Exception:
@@ -2117,6 +2134,10 @@ def rows_to_contacts(rows: List[dict]) -> tuple:
     people, generic_emails, company_linkedin = [], [], ""
     for row in rows:
         company_linkedin = company_linkedin or row.get("company_linkedin", "")
+        # company_email is repeated on every row for this company (like
+        # company_linkedin), and can itself hold several "; "-joined
+        # addresses - collect from every row, not just contact-less ones.
+        generic_emails.extend(split_company_email(row.get("company_email", "")))
         # A row can be a decision-maker with no name on file yet (an email
         # found directly with nobody attached) - checking decision_maker_email
         # too keeps that row from falling through both branches and vanishing.
@@ -2129,9 +2150,7 @@ def rows_to_contacts(rows: List[dict]) -> tuple:
                 email=row.get("decision_maker_email", ""), linkedin_url=row.get("contact_linkedin", ""),
                 unverified=unverified,
             ))
-        elif row.get("company_email"):
-            generic_emails.append(row["company_email"])
-    return people, generic_emails, company_linkedin
+    return people, sorted(set(generic_emails)), company_linkedin
 
 
 def merge_group(old_rows: Optional[List[dict]], new_rows: List[dict]) -> List[dict]:

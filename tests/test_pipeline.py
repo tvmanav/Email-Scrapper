@@ -28,9 +28,27 @@ class TestSplitName:
         assert m.split_name("") == ("", "")
         assert m.split_name(None) == ("", "")
 
+    def test_non_breaking_space_still_splits(self):
+        # A name scraped off a page can be joined by \xa0 instead of a plain
+        # space; partition(" ") alone would leave it stuck in first_name.
+        assert m.split_name("Alex\xa0Melchenko") == ("Alex", "Melchenko")
+
     def test_join_is_the_inverse(self):
         for name in ("Jane Doe", "Mohammed Faleh Al-Qahtani", "Madonna"):
             assert m.join_name(*m.split_name(name)) == name
+
+
+class TestCompanyEmailHelpers:
+    def test_join_dedupes_and_sorts(self):
+        assert m.join_company_emails(["b@a.nl", "a@a.nl", "a@a.nl"]) == "a@a.nl; b@a.nl"
+
+    def test_join_empty(self):
+        assert m.join_company_emails([]) == ""
+
+    def test_split_is_the_inverse(self):
+        assert m.split_company_email("a@a.nl; b@a.nl") == ["a@a.nl", "b@a.nl"]
+        assert m.split_company_email("") == []
+        assert m.split_company_email(None) == []
 
 
 class TestRowHelpers:
@@ -45,13 +63,20 @@ class TestRowHelpers:
             CO, [P("A B", "CEO", "a@a.nl"), P("C D", "CTO")], ["z@a.nl", "b@a.nl", "b@a.nl"],
             "https://www.linkedin.com/company/a",
         )
-        assert len(rows) == 4  # 2 decision makers + 2 deduped generic emails
-        dm_rows = [r for r in rows if r["first_name"]]
-        generic_rows = [r for r in rows if r["company_email"]]
-        assert [(r["first_name"], r["last_name"]) for r in dm_rows] == [("A", "B"), ("C", "D")]
-        assert dm_rows[0]["decision_maker_email"] == "a@a.nl" and dm_rows[1]["decision_maker_email"] == ""
-        assert {r["company_email"] for r in generic_rows} == {"b@a.nl", "z@a.nl"}
+        # One row per named contact - the generic addresses are deduped,
+        # joined, and repeated on every row (like company_linkedin), not
+        # spun out into their own separate rows.
+        assert len(rows) == 2
+        assert [(r["first_name"], r["last_name"]) for r in rows] == [("A", "B"), ("C", "D")]
+        assert rows[0]["decision_maker_email"] == "a@a.nl" and rows[1]["decision_maker_email"] == ""
+        assert all(r["company_email"] == "b@a.nl; z@a.nl" for r in rows)
         assert all(row["company_linkedin"].endswith("/a") for row in rows)
+
+    def test_build_rows_generic_emails_without_contacts_get_one_row(self):
+        rows = m.build_rows(CO, [], ["b@a.nl", "a@a.nl"], "")
+        assert len(rows) == 1
+        assert rows[0]["company_email"] == "a@a.nl; b@a.nl"
+        assert rows[0]["first_name"] == ""
 
     def test_build_rows_unverified_person_marked(self):
         rows = m.build_rows(CO, [P("Jane Doe", "CEO", linkedin_url="u", unverified=True)], [], "")
@@ -842,7 +867,8 @@ class TestRerunGeneric:
         dm_row = a_rows[a_rows.first_name == "Ann"].iloc[0]
         assert dm_row.decision_maker_email == "ann@a.com"
         assert dm_row.contact_linkedin == "https://www.linkedin.com/in/annlee"      # earlier LinkedIn link survives
-        assert "info@a.com" in set(a_rows[a_rows.first_name == ""].company_email)
+        # the generic address is repeated onto the contact's own row now, not a separate blank row
+        assert dm_row.company_email == "info@a.com"
         assert a_rows.iloc[0].company_url == "https://a.com" and a_rows.iloc[0].company_linkedin.endswith("/company/a")
 
     def test_untouched_rows_stay_as_they_were(self, csv_file, monkeypatch):
