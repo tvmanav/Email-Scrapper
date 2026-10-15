@@ -35,6 +35,7 @@ import pandas as pd
 from playwright.sync_api import Page, sync_playwright
 
 from company_email_finder import (
+    GENERIC_EMAIL_PREFIXES,
     OUTPUT_COLUMNS,
     OUTPUT_FILE,
     extract_emails,
@@ -264,7 +265,11 @@ DEBUG_STEPS = os.getenv("APOLLO_DEBUG_STEPS") == "1"
 
 
 def find_email(page: Page, debug_label: str = "") -> tuple:
-    """Returns (email_or_None, source_extension_or_None)."""
+    """Returns (email_or_None, source_extension_or_None). A revealed address
+    that's a shared department mailbox (info@, hr@, sales@, ...) is not this
+    person's own email, even though the extension offered it as their
+    contact - skip it and keep trying the remaining extensions, rather than
+    writing a company-wide inbox into decision_maker_email."""
     for name in EXTENSION_ORDER:
         if EXHAUSTED[name]:
             continue
@@ -279,6 +284,9 @@ def find_email(page: Page, debug_label: str = "") -> tuple:
             continue
         if DEBUG_STEPS and debug_label:
             dump_debug(page, f"{debug_label}_{name}_{'HIT' if email else 'miss'}")
+        if email and email.startswith(GENERIC_EMAIL_PREFIXES):
+            logger.info("%s revealed a shared mailbox (%s), not a personal email; trying the next extension", name, email)
+            continue
         if email:
             return email, name
     return None, None
