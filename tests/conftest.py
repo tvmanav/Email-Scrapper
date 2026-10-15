@@ -10,7 +10,6 @@ from pathlib import Path
 os.environ["GROQ_API_KEY"] = "test-key"
 os.environ["MAX_COMPANIES"] = "0"
 os.environ["SOURCE"] = "clutch"
-os.environ["ZR_QUERY"] = "software"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

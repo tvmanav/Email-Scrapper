@@ -465,9 +465,8 @@ class TestMain:
     @pytest.fixture
     def run(self, monkeypatch):
         monkeypatch.setattr(m, "COMPANY_WORKERS", 1)  # deterministic order for these tests
-        calls = {"clutch": 0, "zr": [], "processed": [], "second": 0}
+        calls = {"clutch": 0, "processed": [], "second": 0}
         monkeypatch.setattr(m, "extract_clutch_companies", lambda url: calls.__setitem__("clutch", calls["clutch"] + 1) or list(self.COS))
-        monkeypatch.setattr(m, "extract_zakelijkeregister_companies", lambda q: calls["zr"].append(q) or list(self.COS))
         def process(company, queue):
             calls["processed"].append(company.name)
             if company.name == "C1":
@@ -486,12 +485,6 @@ class TestMain:
     def test_clutch_source_processes_everyone_and_runs_second_pass(self, run):
         m.main()
         assert run["clutch"] == 1 and run["processed"] == ["C0", "C1", "C2", "C3"] and run["second"] == 1
-
-    def test_zakelijkeregister_source_uses_query(self, run, monkeypatch):
-        monkeypatch.setattr(m, "SOURCE", "zakelijkeregister")
-        monkeypatch.setattr(m, "ZR_QUERY", "software")
-        m.main()
-        assert run["zr"] == ["software"] and run["clutch"] == 0
 
     def test_unknown_source(self, run, monkeypatch):
         monkeypatch.setattr(m, "SOURCE", "yellowpages")

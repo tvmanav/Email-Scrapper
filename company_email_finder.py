@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
-from urllib.parse import urlencode, urljoin, urlparse, urldefrag, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlparse, urldefrag, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -63,17 +63,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 # from the validate_result heuristics only. No Groq key or quota is needed.
 USE_LLM = os.getenv("USE_LLM", "1").lower() not in ("0", "false", "no", "off")
 
-# Where the company list comes from: "clutch" or "zakelijkeregister".
+# Where the company list comes from: "clutch", "clutch_all", "clutch_countries",
+# "clutch_verify" or "rerun_generic" - every Clutch-based mode.
 SOURCE = os.getenv("SOURCE", "clutch").lower()
-OUTPUT_FILE = "company_emails.csv" if SOURCE in ("clutch", "clutch_all", "clutch_countries", "rerun_generic") else f"company_emails_{SOURCE}.csv"
-
-# zakelijkeregister.nl is a plain-HTML Dutch directory (robots.txt allows
-# crawling). Its search sometimes answers with an empty page and succeeds on
-# a retry, so empty pages are retried before being treated as the last page.
-ZR_BASE_URL = "https://zakelijkeregister.nl"
-ZR_QUERY = os.getenv("ZR_QUERY", "software")
-ZR_MAX_PAGES = 100
-ZR_PAGE_ATTEMPTS = 3
+OUTPUT_FILE = "company_emails.csv"
 
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "0"))  # 0 = process all companies, e.g. 5 while testing
 MAX_PAGES_PER_COMPANY = int(os.getenv("MAX_PAGES_PER_COMPANY", "15"))
@@ -850,119 +843,6 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
 
         seen.add(domain)
         companies.append(Company(name=name, url=website))
-
-    logger.info("Found %d companies", len(companies))
-
-    return companies
-
-
-# ============================================================
-# ZAKELIJKEREGISTER EXTRACTION
-# ============================================================
-
-NON_COMPANY_SITE_DOMAINS = ("facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com")
-
-
-def fetch_zr_search_page(query: str, page: int) -> List[tuple]:
-    url = f"{ZR_BASE_URL}/zoeken?{urlencode({'q': query, 'page': page})}"
-
-    for attempt in range(1, ZR_PAGE_ATTEMPTS + 1):
-        html = fetch(url)
-
-        if html:
-            soup = BeautifulSoup(html, "lxml")
-            results = [
-                (link.select_one(".search-result-name").get_text(" ", strip=True), urljoin(ZR_BASE_URL, link["href"]))
-                for link in soup.select("li.search-result-item a.search-result-link[href]")
-                if link.select_one(".search-result-name")
-            ]
-            if results:
-                return results
-
-        # Either the last page or one of the site's random empty answers.
-        logger.info("zakelijkeregister page %d empty (attempt %d/%d)", page, attempt, ZR_PAGE_ATTEMPTS)
-        time.sleep(attempt * 3)
-
-    return []
-
-
-def parse_zr_profile(name: str, html: str) -> Optional[Company]:
-    """Reads only the "Gegevens" block - the page also lists unrelated companies."""
-    soup = BeautifulSoup(html, "lxml")
-    details = soup.select_one("div.kv")
-    if not details:
-        return None
-
-    website, email = "", ""
-
-    for label in details.select("div.k"):
-        key = label.get_text(strip=True).lower()
-        value = label.find_next_sibling("div")
-        if not value:
-            continue
-
-        if key == "website":
-            link = value.find("a", href=True)
-            website = link["href"] if link else ""
-        elif key == "e-mail":
-            # The address is assembled by JS from two data attributes.
-            span = value.select_one("[data-email-user][data-email-domain]")
-            if span:
-                email = normalize_email(f"{span['data-email-user']}@{span['data-email-domain']}")
-
-    website = normalize_url(website)
-    domain = get_domain(website)
-    # A plain .endswith() on these suffixes would also match a real company
-    # whose domain merely ends in the same letters (fedex.com, netflix.com
-    # and relax.com all end in "x.com") - require an exact domain or a
-    # subdomain of it, the same rule domain_matches() uses everywhere else.
-    if not domain or any(domain == d or domain.endswith("." + d) for d in NON_COMPANY_SITE_DOMAINS):
-        return None
-
-    linkedin = ""
-    for a in details.find_all("a", href=True):
-        normalized = normalize_linkedin_url(a["href"])
-        if normalized and normalized[0] == "company":
-            linkedin = normalized[1]
-            break
-
-    # Directory emails are user-submitted, so only trust one on the company's own domain.
-    if email and not domain_matches(email.split("@")[-1], domain):
-        email = ""
-
-    return Company(name=name, url=website, linkedin=linkedin, directory_email=email)
-
-
-def extract_zakelijkeregister_companies(query: str) -> List[Company]:
-    logger.info("Searching zakelijkeregister.nl for: %s", query)
-
-    companies = []
-    seen_profiles = set()
-    seen_domains = set()
-
-    for page in range(1, ZR_MAX_PAGES + 1):
-        results = [r for r in fetch_zr_search_page(query, page) if r[1] not in seen_profiles]
-
-        if not results:
-            break
-
-        with ThreadPoolExecutor(max_workers=LOOKUP_WORKERS) as pool:
-            profile_pages = list(pool.map(fetch, [url for _, url in results]))
-
-        for (name, profile_url), html in zip(results, profile_pages):
-            seen_profiles.add(profile_url)
-
-            company = parse_zr_profile(name, html) if html else None
-
-            if not company or get_domain(company.url) in seen_domains:
-                continue
-
-            seen_domains.add(get_domain(company.url))
-            companies.append(company)
-
-            if 0 < MAX_COMPANIES <= len(companies):
-                logger.info("Found %d companies", len(companies))
-                return companies
 
     logger.info("Found %d companies", len(companies))
 
@@ -2161,8 +2041,8 @@ def load_existing_groups() -> dict:
     there. Keyed by domain (not the raw company_url string) for the same
     reason run_chunked's own resume check uses get_domain(): a "www." prefix
     or a different URL path for the same company must still match, the way
-    extract_clutch_companies/extract_zakelijkeregister_companies already
-    dedupe companies elsewhere in this file."""
+    extract_clutch_companies already dedupes companies elsewhere in this
+    file."""
     global _existing_groups_cache
 
     if not os.path.exists(OUTPUT_FILE):
@@ -2602,9 +2482,7 @@ def main():
     if USE_LLM and not os.getenv("GROQ_API_KEY"):
         raise RuntimeError("GROQ_API_KEY is missing.")
 
-    if SOURCE == "zakelijkeregister":
-        companies = extract_zakelijkeregister_companies(ZR_QUERY)
-    elif SOURCE == "clutch":
+    if SOURCE == "clutch":
         companies = extract_clutch_companies(CLUTCH_URL)
     elif SOURCE == "rerun_generic":
         if not USE_LLM:
@@ -2624,7 +2502,7 @@ def main():
         logger.info("Finished.")
         return
     else:
-        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries', 'rerun_generic' or 'zakelijkeregister'.")
+        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries' or 'rerun_generic'.")
 
     if MAX_COMPANIES > 0:
         companies = companies[:MAX_COMPANIES]
