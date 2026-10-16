@@ -392,3 +392,244 @@ class TestEnsureClutchAccess:
         monkeypatch.setattr(m, "rerun_generic", lambda: None)
         m.main()
         assert called == []
+
+    def test_main_does_not_probe_access_for_clutch_sitemap(self, monkeypatch):
+        monkeypatch.setattr(m, "SOURCE", "clutch_sitemap")
+        called = []
+        monkeypatch.setattr(m, "ensure_clutch_access", lambda: called.append(1))
+        monkeypatch.setattr(m, "collect_clutch_sitemap", lambda limit: [])
+        monkeypatch.setattr(m, "run_chunked", lambda companies: None)
+        m.main()
+        assert called == []  # no Cloudflare dependency, so no probe
+
+
+SITEMAP_INDEX = (
+    '<sitemapindex><sitemap><loc>https://clutch.co/sitemap-profile-1.xml</loc></sitemap>'
+    '<sitemap><loc>https://clutch.co/sitemap-profile-2.xml</loc></sitemap>'
+    '<sitemap><loc>https://clutch.co/sitemap-directory-1.xml</loc></sitemap></sitemapindex>'
+)
+
+
+def sitemap_urlset(*slugs):
+    locs = "".join(f"<url><loc>https://clutch.co/profile/{slug}</loc></url>" for slug in slugs)
+    return f'<urlset>{locs}</urlset>'
+
+
+class TestDiscoverClutchSitemapProfiles:
+    def test_fetches_index_and_every_profile_sub_sitemap_and_caches(self, tmp_path, monkeypatch, fake_site):
+        cache = tmp_path / "profiles.txt"
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_PROFILES_FILE", str(cache))
+        calls = fake_site({
+            m.CLUTCH_SITEMAP_INDEX_URL: SITEMAP_INDEX,
+            "https://clutch.co/sitemap-profile-1.xml": sitemap_urlset("acme", "beta"),
+            "https://clutch.co/sitemap-profile-2.xml": sitemap_urlset("gamma"),
+        })
+
+        profiles = m.discover_clutch_sitemap_profiles()
+
+        assert profiles == [
+            "https://clutch.co/profile/acme", "https://clutch.co/profile/beta", "https://clutch.co/profile/gamma",
+        ]
+        assert calls == [m.CLUTCH_SITEMAP_INDEX_URL, "https://clutch.co/sitemap-profile-1.xml",
+                          "https://clutch.co/sitemap-profile-2.xml"]  # directory sitemaps are irrelevant, never fetched
+        assert cache.read_text().splitlines() == profiles
+
+    def test_cached_file_is_reused_without_any_network_call(self, tmp_path, monkeypatch):
+        cache = tmp_path / "profiles.txt"
+        cache.write_text("https://clutch.co/profile/acme\nhttps://clutch.co/profile/beta\n")
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_PROFILES_FILE", str(cache))
+
+        profiles = m.discover_clutch_sitemap_profiles()  # session.get would raise if called (see isolate fixture)
+
+        assert profiles == ["https://clutch.co/profile/acme", "https://clutch.co/profile/beta"]
+
+
+class TestWaybackSnapshotUrl:
+    def test_wraps_the_url_with_a_timestamp_and_raw_id_mode(self):
+        url = m.wayback_snapshot_url("https://clutch.co/profile/acme")
+        assert url.startswith("https://web.archive.org/web/")
+        assert url.endswith("id_/https://clutch.co/profile/acme")
+
+
+class TestFetchWaybackHtml:
+    def test_returns_html_on_200(self, monkeypatch):
+        resp = m.requests.Response()
+        resp.status_code = 200
+        resp._content = b"<html>ok</html>"
+        monkeypatch.setattr(m.session, "get", lambda url, **kw: resp)
+        assert m.fetch_wayback_html("https://clutch.co/profile/acme") == "<html>ok</html>"
+
+    def test_404_means_no_snapshot_no_retry(self, monkeypatch):
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            resp = m.requests.Response()
+            resp.status_code = 404
+            return resp
+
+        monkeypatch.setattr(m.session, "get", get)
+        assert m.fetch_wayback_html("https://clutch.co/profile/missing") is None
+        assert len(calls) == 1
+
+    def test_rate_limit_is_retried_then_succeeds(self, monkeypatch):
+        statuses = iter([429, 200])
+
+        def get(url, **kw):
+            resp = m.requests.Response()
+            resp.status_code = next(statuses)
+            if resp.status_code == 200:
+                resp._content = b"<html>recovered</html>"
+            return resp
+
+        monkeypatch.setattr(m.session, "get", get)
+        assert m.fetch_wayback_html("https://clutch.co/profile/acme") == "<html>recovered</html>"
+
+    def test_persistent_failure_gives_up_after_max_retries(self, monkeypatch):
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            resp = m.requests.Response()
+            resp.status_code = 503
+            return resp
+
+        monkeypatch.setattr(m.session, "get", get)
+        assert m.fetch_wayback_html("https://clutch.co/profile/acme") is None
+        assert len(calls) == m.WAYBACK_MAX_RETRIES
+
+    def test_connection_error_is_retried(self, monkeypatch):
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                raise m.requests.ConnectionError("boom")
+            resp = m.requests.Response()
+            resp.status_code = 200
+            resp._content = b"ok"
+            return resp
+
+        monkeypatch.setattr(m.session, "get", get)
+        assert m.fetch_wayback_html("https://clutch.co/profile/acme") == "ok"
+
+
+PROFILE_HTML = """
+<html><body>
+<h1>Acme Corp</h1>
+<a class="website-link__item" href="https://r.clutch.co/redirect?x=1">Visit Website</a>
+<div id="pricing-snapshot-services">
+  <button class="pricing-snapshot__service" data-service-line="all">All</button>
+  <button class="pricing-snapshot__service" data-service-line="Web Development">Web Development</button>
+  <button class="pricing-snapshot__service" data-service-line="Mobile App Development">Mobile App Development</button>
+</div>
+</body></html>
+"""
+
+
+class TestExtractClutchSitemapCompany:
+    def test_extracts_name_and_resolves_website(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_clutch_redirect", lambda href: "https://acme.com")
+        company = m.extract_clutch_sitemap_company(PROFILE_HTML)
+        assert company.name == "Acme Corp" and company.url == "https://acme.com"
+
+    def test_missing_name_or_link_returns_none(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_clutch_redirect", lambda href: "https://acme.com")
+        assert m.extract_clutch_sitemap_company("<html><body>no h1 or link</body></html>") is None
+        assert m.extract_clutch_sitemap_company("<html><body><h1>Acme</h1></body></html>") is None
+
+    def test_unresolved_redirect_returns_none(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_clutch_redirect", lambda href: None)
+        assert m.extract_clutch_sitemap_company(PROFILE_HTML) is None
+
+    def test_service_keyword_filter_keeps_matching_profile(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_clutch_redirect", lambda href: "https://acme.com")
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_SERVICE_KEYWORD", "mobile")
+        assert m.extract_clutch_sitemap_company(PROFILE_HTML) is not None
+
+    def test_service_keyword_filter_drops_non_matching_profile(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_clutch_redirect", lambda href: "https://acme.com")
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_SERVICE_KEYWORD", "blockchain")
+        assert m.extract_clutch_sitemap_company(PROFILE_HTML) is None
+
+    def test_no_keyword_set_means_no_filtering(self, monkeypatch):
+        monkeypatch.setattr(m, "resolve_clutch_redirect", lambda href: "https://acme.com")
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_SERVICE_KEYWORD", "")
+        assert m.extract_clutch_sitemap_company(PROFILE_HTML) is not None
+
+
+class TestLoadClutchSitemapCompanies:
+    def test_dedupes_by_domain(self, tmp_path, monkeypatch):
+        resolved = tmp_path / "resolved.jsonl"
+        resolved.write_text(
+            '{"name": "Acme", "url": "https://acme.com"}\n'
+            '{"name": "Acme Dup", "url": "https://www.acme.com/en"}\n'
+            '{"name": "Beta", "url": "https://beta.io"}\n'
+        )
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(resolved))
+        companies = m.load_clutch_sitemap_companies()
+        assert [c.name for c in companies] == ["Acme", "Beta"]
+
+    def test_missing_file_returns_empty_list(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(tmp_path / "missing.jsonl"))
+        assert m.load_clutch_sitemap_companies() == []
+
+
+class TestCollectClutchSitemap:
+    def setup(self, tmp_path, monkeypatch, profiles):
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(tmp_path / "resolved.jsonl"))
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_DONE_FILE", str(tmp_path / "done.txt"))
+        monkeypatch.setattr(m, "discover_clutch_sitemap_profiles", lambda: profiles)
+
+    def test_resolves_every_profile_and_returns_deduped_companies(self, tmp_path, monkeypatch):
+        profiles = ["https://clutch.co/profile/acme", "https://clutch.co/profile/beta"]
+        self.setup(tmp_path, monkeypatch, profiles)
+        html_by_url = {
+            profiles[0]: "<html>acme</html>",
+            profiles[1]: "<html>beta</html>",
+        }
+        companies_by_html = {
+            "<html>acme</html>": m.Company("Acme", "https://acme.com"),
+            "<html>beta</html>": m.Company("Beta", "https://beta.io"),
+        }
+        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: html_by_url[url])
+        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: companies_by_html[html])
+
+        companies = m.collect_clutch_sitemap(0)
+
+        assert [c.name for c in companies] == ["Acme", "Beta"]
+
+    def test_profile_with_no_snapshot_is_skipped_but_still_marked_done(self, tmp_path, monkeypatch):
+        profiles = ["https://clutch.co/profile/acme", "https://clutch.co/profile/gone"]
+        self.setup(tmp_path, monkeypatch, profiles)
+        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: "<html>x</html>" if "acme" in url else None)
+        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: m.Company("Acme", "https://acme.com"))
+
+        companies = m.collect_clutch_sitemap(0)
+
+        assert [c.name for c in companies] == ["Acme"]
+        done = (tmp_path / "done.txt").read_text()
+        assert "acme" in done and "gone" in done  # both marked done - "gone" has no snapshot, not an error to retry
+
+    def test_resumes_by_skipping_already_done_profiles(self, tmp_path, monkeypatch):
+        profiles = ["https://clutch.co/profile/acme", "https://clutch.co/profile/beta"]
+        self.setup(tmp_path, monkeypatch, profiles)
+        (tmp_path / "done.txt").write_text(profiles[0] + "\n")
+        fetched = []
+        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: fetched.append(url) or "<html>x</html>")
+        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: m.Company("Beta", "https://beta.io"))
+
+        m.collect_clutch_sitemap(0)
+
+        assert fetched == [profiles[1]]  # already-done "acme" is never re-fetched
+
+    def test_limit_caps_how_many_profiles_are_processed(self, tmp_path, monkeypatch):
+        profiles = [f"https://clutch.co/profile/p{i}" for i in range(5)]
+        self.setup(tmp_path, monkeypatch, profiles)
+        fetched = []
+        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: fetched.append(url) or "<html>x</html>")
+        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: m.Company("X", f"https://{len(fetched)}.com"))
+
+        m.collect_clutch_sitemap(2)
+
+        assert len(fetched) == 2

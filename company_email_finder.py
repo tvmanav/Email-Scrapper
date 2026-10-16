@@ -100,6 +100,23 @@ CLUTCH_VERIFY_WAIT_SECONDS = int(os.getenv("CLUTCH_VERIFY_WAIT_SECONDS", "300"))
 # verified in; Cloudflare keeps challenging the headless variant.
 CLUTCH_HEADED = os.getenv("CLUTCH_HEADED", "0").lower() in ("1", "true", "yes", "on")
 
+# SOURCE=clutch_sitemap never needs Cloudflare clearance at all: Clutch's own
+# sitemap (unlike every actual content page on the site) isn't challenged, and
+# neither is the Wayback Machine's archived copy of each profile page it
+# lists - so the company name and "visit website" redirect link come from
+# there instead of a live, Cloudflare-gated render.
+CLUTCH_SITEMAP_INDEX_URL = "https://clutch.co/sitemap.xml"
+CLUTCH_SITEMAP_PROFILES_FILE = "clutch_sitemap_profiles.txt"
+CLUTCH_SITEMAP_RESOLVED_FILE = "clutch_sitemap_companies.jsonl"
+CLUTCH_SITEMAP_DONE_FILE = "clutch_sitemap_done.txt"
+# Case-insensitive substring match against each profile's listed service
+# lines (e.g. "Web Development"). Sitemap profiles have no category the way
+# Clutch's own category-specific listing pages do, so this is a best-effort
+# stand-in; empty (default) means no filtering - every profile is kept.
+CLUTCH_SITEMAP_SERVICE_KEYWORD = os.getenv("CLUTCH_SITEMAP_SERVICE_KEYWORD", "").strip().lower()
+WAYBACK_MAX_RETRIES = 3
+WAYBACK_RETRY_DELAY_SECONDS = 20  # archive.org rate-limits hard; back off rather than give up
+
 # A page with no extracted email can't supply a validated email on its
 # own, so the LLM context prioritizes pages that have one and caps
 # total size - Groq's free tier allows only 8K tokens/minute.
@@ -916,6 +933,160 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
     logger.info("Found %d companies", len(companies))
 
     return companies
+
+
+# ============================================================
+# CLUTCH SITEMAP DISCOVERY (no Cloudflare clearance needed)
+# ============================================================
+
+def discover_clutch_sitemap_profiles() -> List[str]:
+    """
+    Every clutch.co/profile/<slug> URL, read from Clutch's own sitemap -
+    unlike every actual content page on the site (including robots.txt),
+    sitemap*.xml isn't behind Cloudflare's challenge. Cached to disk since
+    the full set spans dozens of large XML files and barely changes
+    between runs.
+    """
+    if os.path.exists(CLUTCH_SITEMAP_PROFILES_FILE):
+        with open(CLUTCH_SITEMAP_PROFILES_FILE) as f:
+            return [line.strip() for line in f if line.strip()]
+
+    index = session.get(CLUTCH_SITEMAP_INDEX_URL, timeout=REQUEST_TIMEOUT)
+    if index.status_code != 200:
+        raise RuntimeError(f"Could not load Clutch's sitemap index (status {index.status_code})")
+    sub_sitemaps = re.findall(r"<loc>(https://clutch\.co/sitemap-profile-\d+\.xml)</loc>", index.text)
+
+    profile_urls = []
+    for sub_url in sub_sitemaps:
+        resp = session.get(sub_url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("Skipping %s (status %d)", sub_url, resp.status_code)
+            continue
+        profile_urls.extend(re.findall(r"<loc>(https://clutch\.co/profile/[^<]+)</loc>", resp.text))
+        time.sleep(CRAWL_DELAY)
+
+    with open(CLUTCH_SITEMAP_PROFILES_FILE, "w") as f:
+        f.write("\n".join(profile_urls))
+
+    logger.info("Discovered %d Clutch profile URLs from its sitemap", len(profile_urls))
+
+    return profile_urls
+
+
+def wayback_snapshot_url(url: str) -> str:
+    timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    return f"https://web.archive.org/web/{timestamp}id_/{url}"
+
+
+def fetch_wayback_html(url: str) -> Optional[str]:
+    """
+    Fetches the most recent Wayback Machine snapshot of a page Cloudflare
+    won't serve directly. archive.org rate-limits hard, so a 429 or 5xx is
+    retried with backoff rather than treated as "no snapshot exists" -
+    only a 404 means that.
+    """
+    target = wayback_snapshot_url(url)
+
+    for attempt in range(1, WAYBACK_MAX_RETRIES + 1):
+        try:
+            resp = session.get(target, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            logger.warning("Wayback fetch failed (%d/%d): %s | %s", attempt, WAYBACK_MAX_RETRIES, url, e)
+        else:
+            if resp.status_code == 200:
+                return resp.text
+            if resp.status_code == 404:
+                return None
+            logger.warning("Wayback status %d (%d/%d): %s", resp.status_code, attempt, WAYBACK_MAX_RETRIES, url)
+
+        time.sleep(WAYBACK_RETRY_DELAY_SECONDS * attempt)
+
+    return None
+
+
+def extract_clutch_sitemap_company(html: str) -> Optional[Company]:
+    """
+    Parses an archived Clutch profile page for the company's name and real
+    website. Wayback's `id_` raw mode leaves the "Visit Website" link
+    unrewritten, so the live resolve_clutch_redirect() resolves it exactly
+    as it would from a freshly rendered (non-archived) page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    name_el = soup.select_one("h1")
+    name = name_el.get_text(" ", strip=True) if name_el else None
+
+    link_el = soup.select_one("a.website-link__item")
+    if not name or not link_el or not link_el.get("href"):
+        return None
+
+    if CLUTCH_SITEMAP_SERVICE_KEYWORD:
+        service_lines = [
+            (b.get("data-service-line") or "").lower()
+            for b in soup.select(".pricing-snapshot__service[data-service-line]")
+        ]
+        if not any(CLUTCH_SITEMAP_SERVICE_KEYWORD in line for line in service_lines):
+            return None
+
+    website = resolve_clutch_redirect(link_el["href"])
+    if not website:
+        return None
+
+    return Company(name=name, url=website)
+
+
+def load_clutch_sitemap_companies() -> List[Company]:
+    """Unique-by-domain companies already resolved in a previous run."""
+    companies, seen = [], set()
+    if os.path.exists(CLUTCH_SITEMAP_RESOLVED_FILE):
+        with open(CLUTCH_SITEMAP_RESOLVED_FILE) as f:
+            for line in f:
+                item = json.loads(line)
+                domain = get_domain(item["url"])
+                if domain and domain not in seen:
+                    seen.add(domain)
+                    companies.append(Company(name=item["name"], url=item["url"]))
+
+    return companies
+
+
+def collect_clutch_sitemap(limit: int) -> List[Company]:
+    """
+    Alternative Clutch discovery that never needs Cloudflare clearance:
+    walks profile URLs from Clutch's own sitemap and reads each one's
+    archived Wayback Machine snapshot instead of the live, Cloudflare-
+    gated profile page. Resolved companies are cached in
+    CLUTCH_SITEMAP_RESOLVED_FILE and done profiles tracked in
+    CLUTCH_SITEMAP_DONE_FILE, so a long run can be stopped and resumed.
+    Archived snapshots can lag behind a company's current real site, and
+    there's no per-category filter the way Clutch's own listing pages have;
+    CLUTCH_SITEMAP_SERVICE_KEYWORD only approximates one.
+    """
+    profiles = discover_clutch_sitemap_profiles()
+    done = read_lines(CLUTCH_SITEMAP_DONE_FILE)
+    todo = [p for p in profiles if p not in done]
+    if limit > 0:
+        todo = todo[:limit]
+
+    resolved = 0
+
+    for i, profile_url in enumerate(todo, 1):
+        html = fetch_wayback_html(profile_url)
+
+        if html is not None:
+            company = extract_clutch_sitemap_company(html)
+            if company:
+                resolved += 1
+                with open(CLUTCH_SITEMAP_RESOLVED_FILE, "a") as f:
+                    f.write(json.dumps({"name": company.name, "url": company.url}) + "\n")
+
+        with open(CLUTCH_SITEMAP_DONE_FILE, "a") as f:
+            f.write(profile_url + "\n")
+
+        if i % 50 == 0 or i == len(todo):
+            logger.info("Sitemap discovery: %d/%d profiles processed, %d companies resolved", i, len(todo), resolved)
+
+    return load_clutch_sitemap_companies()
 
 
 # ============================================================
@@ -2632,8 +2803,16 @@ def main():
         run_chunked(companies)
         logger.info("Finished.")
         return
+    elif SOURCE == "clutch_sitemap":
+        companies = collect_clutch_sitemap(MAX_COMPANIES)
+        run_chunked(companies)
+        logger.info("Finished.")
+        return
     else:
-        raise RuntimeError(f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries' or 'rerun_generic'.")
+        raise RuntimeError(
+            f"Unknown SOURCE {SOURCE!r}: use 'clutch', 'clutch_all', 'clutch_countries', "
+            "'clutch_sitemap' or 'rerun_generic'."
+        )
 
     if MAX_COMPANIES > 0:
         companies = companies[:MAX_COMPANIES]

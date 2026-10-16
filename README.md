@@ -88,6 +88,7 @@ With no environment variables, this:
 | `clutch` | A single discovery pass over `CLUTCH_URL` as given (no pagination walk). |
 | `clutch_countries` | Walks one country at a time (`clutch.co/<cc>/<category>`) until Clutch returns an empty page, then moves to the next. `CLUTCH_COUNTRIES="se,no,dk"` fixes the list/order; leave unset to auto-discover every country Clutch lists. |
 | `clutch_verify` | Only runs the interactive Cloudflare check and exits — useful to pre-verify before a long unattended run. Not usually needed by hand anymore; `clutch`/`clutch_all`/`clutch_countries` now do this automatically. |
+| `clutch_sitemap` | Alternative discovery that never needs Cloudflare clearance at all: reads every profile URL from Clutch's own sitemap (not challenged, unlike every actual content page) and each profile's last Wayback Machine snapshot (also not challenged) instead of the live page. Covers Clutch's *entire* directory, not just one category — `CLUTCH_SITEMAP_SERVICE_KEYWORD` (e.g. `developer`) approximates a category filter against each profile's listed service lines, since sitemap entries carry no category of their own. Archived snapshots can lag behind a company's current real site. Checkpointed in `clutch_sitemap_profiles.txt` / `clutch_sitemap_done.txt` / `clutch_sitemap_companies.jsonl`, so a long run can be stopped and resumed. |
 | `rerun_generic` | Doesn't crawl new companies — gives every existing company that still has no decision-maker email a fresh LLM pass, until the daily Groq quota runs out. Resumable via `rerun_done.txt`. |
 
 ### Useful env vars
@@ -96,7 +97,8 @@ With no environment variables, this:
 |---|---|---|
 | `CLUTCH_URL` | `https://clutch.co/developers` | Listing URL to crawl (for `clutch` / `clutch_all`). |
 | `CLUTCH_ALL_PAGES` | `1122` | Upper bound on listing pages for `clutch_all` — the real listing is far smaller in practice for most categories, but this caps a runaway walk. Lower it (e.g. `CLUTCH_ALL_PAGES=25`) to bound a single run. |
-| `MAX_COMPANIES` | `0` (all) | Cap the number of companies actually processed — handy while testing. |
+| `MAX_COMPANIES` | `0` (all) | Cap the number of companies actually processed — handy while testing. For `clutch_sitemap` this also caps how many profiles are resolved via Wayback in that run, since resolving is itself a network round-trip per profile. |
+| `CLUTCH_SITEMAP_SERVICE_KEYWORD` | `""` (none) | For `clutch_sitemap`: case-insensitive substring match against each profile's listed service lines (e.g. `developer`). Empty means no filtering — every profile is kept. |
 | `USE_LLM` | `1` | Set to `0` to skip every Groq call entirely; emails/people then come from heuristics only (no API key needed). |
 | `WORKERS` | `4` | Companies processed in parallel. |
 | `CLUTCH_HEADED` | `0` | Set to `1` to render every Clutch page in a visible window (debugging). |
