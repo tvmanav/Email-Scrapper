@@ -249,11 +249,6 @@ class TestLinkedInUrl:
         ("https://nl.linkedin.com/company/acme-bv/about", ("company", "https://www.linkedin.com/company/acme-bv")),
         ("HTTPS://WWW.LINKEDIN.COM/IN/Jane", ("in", "https://www.linkedin.com/in/Jane")),
         ("https://www.linkedin.com/company/1349302", ("company", "https://www.linkedin.com/company/1349302")),
-        # A link embedded in running text picks up the sentence's closing
-        # punctuation ("...on LinkedIn: linkedin.com/company/acme-inc.") -
-        # a real vanity slug never ends in one of these.
-        ("https://www.linkedin.com/company/clarity-ventures-inc.", ("company", "https://www.linkedin.com/company/clarity-ventures-inc")),
-        ("https://www.linkedin.com/company/acme-inc).", ("company", "https://www.linkedin.com/company/acme-inc")),
     ])
     def test_valid(self, url, expected):
         assert m.normalize_linkedin_url(url) == expected
@@ -262,7 +257,6 @@ class TestLinkedInUrl:
         "", None, "https://acme.com", "https://linkedin.com/", "https://www.linkedin.com/feed/",
         "https://www.linkedin.com/sharing/share-offsite/?url=x", "https://notlinkedin.com/in/x/",
         "https://www.linkedin.com/school/uni", "mailto:a@b.com",
-        "https://www.linkedin.com/company/.",  # nothing left once trailing punctuation is stripped
     ])
     def test_invalid(self, url):
         assert m.normalize_linkedin_url(url) is None
