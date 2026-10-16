@@ -19,6 +19,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from ddgs import DDGS
+from ddgs.exceptions import RatelimitException, TimeoutException as DDGSTimeoutException
 from openai import OpenAI, RateLimitError
 from playwright.sync_api import sync_playwright
 from pydantic import BaseModel, Field
@@ -367,12 +368,29 @@ def is_safe_url(url: str) -> bool:
     if not host:
         return False
 
-    try:
-        addresses = {info[4][0] for info in socket.getaddrinfo(host, None)}
-    except socket.gaierror:
-        # Nothing to attack if the name doesn't resolve, and a transient DNS
-        # hiccup must not silently drop a legitimate company from the run.
+    # socket.getaddrinfo() has no timeout parameter, unlike every other
+    # network call in this module - run it on a side thread and bound how
+    # long we wait, so a stuck DNS resolver stalls this check instead of the
+    # calling worker forever.
+    outcome = {}
+
+    def resolve():
+        try:
+            outcome["addresses"] = {info[4][0] for info in socket.getaddrinfo(host, None)}
+        except socket.gaierror:
+            outcome["addresses"] = None
+
+    resolver = threading.Thread(target=resolve, daemon=True)
+    resolver.start()
+    resolver.join(REQUEST_TIMEOUT)
+
+    if resolver.is_alive() or outcome.get("addresses") is None:
+        # Nothing to attack if the name doesn't resolve (or resolution is
+        # stuck), and a transient DNS hiccup must not silently drop a
+        # legitimate company from the run.
         return True
+
+    addresses = outcome["addresses"]
 
     return all(
         not (ip.is_private or ip.is_loopback or ip.is_link_local
@@ -647,6 +665,31 @@ def open_clutch_context(p, headless: bool):
     return context
 
 
+def wait_for_cloudflare_clearance(
+    page, max_wait_ms: int = CLUTCH_RENDER_WAIT_MS, min_wait_ms: int = 2000
+) -> None:
+    """
+    Polls the page once a second for Cloudflare's "Just a moment..." JS
+    challenge to clear, instead of always sleeping the full wait budget -
+    a real challenge can take longer than the old flat sleep allowed, so
+    this keeps waiting up to the max instead of giving up early. min_wait_ms
+    still enforces the old sleep's floor even once cleared: the challenge
+    text disappearing doesn't mean the listing itself has finished
+    hydrating yet, and the already-cleared (cached-session) case is the
+    common one, so it must get at least as much settle time as before.
+    """
+    waited_ms = 0
+    for _ in range(max(1, max_wait_ms // 1000)):
+        page.wait_for_timeout(1000)
+        waited_ms += 1000
+        try:
+            cleared = "Just a moment" not in page.content()
+        except Exception:
+            cleared = False  # mid-navigation, which is what clearing looks like
+        if cleared and waited_ms >= min_wait_ms:
+            return
+
+
 def render_clutch_listing_html(clutch_url: str) -> str:
     """
     Clutch serves a Cloudflare "Just a moment..." JS challenge to plain HTTP
@@ -658,7 +701,7 @@ def render_clutch_listing_html(clutch_url: str) -> str:
 
         page = context.new_page()
         page.goto(clutch_url, wait_until="domcontentloaded", timeout=CLUTCH_PAGE_TIMEOUT_MS)
-        page.wait_for_timeout(CLUTCH_RENDER_WAIT_MS)
+        wait_for_cloudflare_clearance(page)
 
         # Clutch lazy-loads extra providers behind a "See more providers"
         # button. Click it until it disappears/disables so the full list
@@ -778,9 +821,9 @@ def extract_clutch_companies(clutch_url: str) -> List[Company]:
 
     rows = []
 
-    last_error = None
-
     for attempt in range(1, CLUTCH_RENDER_MAX_ATTEMPTS + 1):
+        last_error = None  # only the latest attempt's outcome should reach the final error
+
         try:
             html = render_clutch_listing_html(clutch_url)
         except Exception as e:
@@ -1160,7 +1203,9 @@ PAGE TEXT:
 {relevant_text(page.text, page.emails, limit)}
 """
         if used_chars + len(section) > LLM_CONTEXT_CHAR_BUDGET:
-            break
+            # Skip just this oversized page - a smaller, lower-priority page
+            # later in `ordered` may still fit the remaining budget.
+            continue
 
         sections.append(section)
         used_chars += len(section)
@@ -1510,9 +1555,16 @@ def search_web(query: str, budget: SearchBudget) -> List[dict]:
 
         try:
             return DDGS(timeout=LINKEDIN_SEARCH_TIMEOUT).text(query, max_results=LINKEDIN_SEARCH_RESULTS) or []
+        except (RatelimitException, DDGSTimeoutException) as e:
+            # ddgs's own typed exceptions for these - always worth retrying,
+            # regardless of whatever wording happens to be in the message.
+            logger.warning("Search failed (%d/%d): %s | %s", attempt, LINKEDIN_SEARCH_MAX_ATTEMPTS, query, e)
+            time.sleep(LINKEDIN_SEARCH_DELAY * attempt)
         except Exception as e:
-            # ddgs raises on timeouts and rate limits, but also to say "no
-            # results" - and asking again never changes that answer.
+            # Every other ddgs error (including "no results") comes back as
+            # the same untyped exception, so the message is the only signal
+            # left to tell "nothing found, asking again won't change that"
+            # apart from a real failure worth retrying.
             if "no results" in str(e).lower():
                 logger.info("No search results: %s", query)
                 return []
@@ -2497,14 +2549,18 @@ def ensure_clutch_access() -> None:
     run SOURCE=clutch_verify (or whose profile's Cloudflare clearance has
     expired) should still work without a separate manual step first: probe
     with one quick headless request, and only fall back to opening a visible
-    browser for the interactive check if that profile isn't cleared."""
-    try:
-        html = render_clutch_listing_html(f"https://clutch.co/{CLUTCH_COUNTRY_CATEGORY}")
-    except Exception:
-        html = ""
+    browser for the interactive check if that profile isn't cleared. One
+    immediate retry first: a probe can land before the listing has fully
+    hydrated even though the profile really is cleared, and that's worth a
+    second quick look before paying for a visible-browser round trip."""
+    for _ in range(2):
+        try:
+            html = render_clutch_listing_html(f"https://clutch.co/{CLUTCH_COUNTRY_CATEGORY}")
+        except Exception:
+            html = ""
 
-    if "provider-row" in html:
-        return
+        if "provider-row" in html:
+            return
 
     logger.info(
         "Clutch access isn't verified yet (new profile, or an expired one) - "

@@ -165,14 +165,14 @@ CREDITS_EXHAUSTED_RE = re.compile(
     r"upgrade (your plan|to (continue|reveal|unlock))", re.I,
 )
 
-def try_apollo(page: Page) -> Optional[str]:
+def try_apollo(page: Page, baseline_before: Optional[str] = None) -> Optional[str]:
     # Apollo's toolbar icon (data-cy is Apollo's own QA hook, stabler than
     # its hashed CSS classes) is collapsed by default; clicking it opens
     # the actual contact panel elsewhere in the DOM.
     icon = page.locator("#apollo-everywhere-overlay-icon")
     if icon.count() == 0:
         return None
-    before = page.locator("body").inner_text(timeout=5000)
+    before = baseline_before if baseline_before is not None else page.locator("body").inner_text(timeout=5000)
     try:
         # force=True: Kendo's panel renders at the maximum possible z-index
         # (2147483647) and visually covers Apollo's icon, so a normal click
@@ -196,7 +196,7 @@ def try_apollo(page: Page) -> Optional[str]:
     return new_email(before, after)
 
 
-def try_kendo(page: Page) -> Optional[str]:
+def try_kendo(page: Page, baseline_before: Optional[str] = None) -> Optional[str]:
     panel = page.locator("#kendo_elem")
     if panel.count() == 0:
         return None
@@ -228,7 +228,7 @@ def try_kendo(page: Page) -> Optional[str]:
     return new_email(before, after)
 
 
-def try_salesql(page: Page) -> Optional[str]:
+def try_salesql(page: Page, baseline_before: Optional[str] = None) -> Optional[str]:
     # SalesQL's floating badge is identified via its alt text (its own CSS
     # classes are build-hashed and change between versions); clicking the
     # collapsed badge only expands a summary ("5 emails found") - the actual
@@ -236,7 +236,7 @@ def try_salesql(page: Page) -> Optional[str]:
     badge = page.locator("img[alt='SalesQL']").first
     if badge.count() == 0:
         return None
-    before = page.locator("body").inner_text(timeout=5000)
+    before = baseline_before if baseline_before is not None else page.locator("body").inner_text(timeout=5000)
     try:
         badge.click(timeout=5000)
         page.wait_for_timeout(2000)
@@ -270,11 +270,21 @@ def find_email(page: Page, debug_label: str = "") -> tuple:
     person's own email, even though the extension offered it as their
     contact - skip it and keep trying the remaining extensions, rather than
     writing a company-wide inbox into decision_maker_email."""
+    try:
+        # Captured once, before any extension acts, and reused as every
+        # extractor's "before" snapshot: otherwise an email one extension
+        # reveals in the page body becomes the NEXT extension's own
+        # before-snapshot baseline, making it look already-present there
+        # too and hiding a genuinely new email forever.
+        baseline_before = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        baseline_before = None
+
     for name in EXTENSION_ORDER:
         if EXHAUSTED[name]:
             continue
         try:
-            email = EXTRACTORS[name](page)
+            email = EXTRACTORS[name](page, baseline_before)
         except CreditsExhausted:
             logger.warning("%s reports no credits left; skipping it for the rest of this run.", name)
             EXHAUSTED[name] = True
