@@ -146,6 +146,24 @@ class TestValidateResult:
         assert out.decision_makers[0].name == "Jane Doe" and out.decision_makers[0].email == ""
         assert out.contact_emails == ["info@acme.com"]  # not lost, just not attributed to her personally
 
+    def test_real_email_misattributed_to_a_different_person_is_demoted_not_kept(self):
+        """jane@acme.com is a real address on the site, but attributed here
+        to Bob - whose name shares nothing with it. The model pairing a real
+        email with the wrong person is exactly the failure this guards
+        against (one name mentioned near another's email in the page text)."""
+        out = m.validate_result(m.LLMDecision(decision_makers=[dm("Bob Smith", "Sales", "jane@acme.com")]), self.PAGES)
+        assert out.decision_makers[0].name == "Bob Smith" and out.decision_makers[0].email == ""
+        assert out.contact_emails == ["jane@acme.com"]  # not lost, just not attributed to him personally
+
+    def test_email_matching_first_or_last_name_alone_is_accepted(self):
+        pages = [page(text="Jane Doe is our CEO.", emails=["jane@acme.com"])]
+        out = m.validate_result(m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "jane@acme.com")]), pages)
+        assert out.decision_makers[0].email == "jane@acme.com"
+
+        pages = [page(text="Jane Doe is our CEO.", emails=["doe@acme.com"])]
+        out = m.validate_result(m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "doe@acme.com")]), pages)
+        assert out.decision_makers[0].email == "doe@acme.com"
+
     def test_generic_mailbox_still_surfaces_when_another_dm_has_a_real_email(self):
         res = m.LLMDecision(decision_makers=[dm("Jane Doe", "CEO", "jane@acme.com"), dm("John Roe", "CTO", "info@acme.com")])
         out = m.validate_result(res, self.PAGES)

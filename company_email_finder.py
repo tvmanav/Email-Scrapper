@@ -1691,10 +1691,11 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
 
     decision_makers = []
     seen = set()
-    # A shared company mailbox the model attributed to a specific person is
-    # never that person's own email, even though it is a real address found
-    # on the site - keep it as a company-level contact instead of losing it.
-    rejected_generic_emails = set()
+    # A shared company mailbox, or a real email tied to a different person
+    # on the site (the model attributed someone else's address to this
+    # person), is never this person's own email - keep it as a
+    # company-level contact instead of losing it or misattributing it.
+    demoted_emails = set()
 
     for person in result.decision_makers:
         name = person.name.strip()
@@ -1710,7 +1711,10 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
         if email not in website_emails:
             email = ""
         elif email.startswith(GENERIC_EMAIL_PREFIXES):
-            rejected_generic_emails.add(email)
+            demoted_emails.add(email)
+            email = ""
+        elif not email_matches_name(email, name):
+            demoted_emails.add(email)
             email = ""
 
         decision_makers.append(DecisionMaker(name=name, title=clean_title(person.title), email=email))
@@ -1719,10 +1723,10 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
     decision_makers = decision_makers[:MAX_DECISION_MAKERS]
 
     # If any decision maker has an email, ignore fallback contact emails -
-    # but a generic mailbox rejected above still deserves to surface as the
-    # company's own contact address.
+    # but a generic or misattributed address demoted above still deserves
+    # to surface as the company's own contact address.
     if any(person.email for person in decision_makers):
-        return LLMDecision(decision_makers=decision_makers, contact_emails=sorted(rejected_generic_emails))
+        return LLMDecision(decision_makers=decision_makers, contact_emails=sorted(demoted_emails))
 
     # Otherwise fall back to contact emails. Trust the LLM's picks as long
     # as the exact email genuinely appears on the website - don't
@@ -1732,7 +1736,7 @@ def validate_result(result: LLMDecision, pages: List[PageData]) -> LLMDecision:
     contact_emails = {
         normalize_email(email) for email in result.contact_emails
         if normalize_email(email) in website_emails
-    } | rejected_generic_emails
+    } | demoted_emails
 
     # If the LLM found nothing, fall back to a generic-prefix heuristic
     # over the emails actually extracted from the site.
@@ -2022,6 +2026,27 @@ def email_local_candidates(first: str, last: str) -> set:
         first + last, last + first, first[0] + last, last + first[0],
         first + last[0], last[0] + first,
     }
+
+
+def email_matches_name(email: str, name: str) -> bool:
+    """
+    A loose check that an email's local part relates at all to this
+    person's name - first or last name as a substring, in either
+    direction. Lenient on purpose (first.last@, flast@ and first@ all
+    legitimately vary), so this only exists to catch a clear mismatch: a
+    real email on the site that's plainly tied to a different person (e.g.
+    the founder's own address, mentioned elsewhere on the page) which the
+    model attributed to someone else instead.
+    """
+    first, last = name_parts(name)
+    if not first:
+        return True
+
+    local = alnum(email.split("@")[0])
+    if not local:
+        return False
+
+    return any(part in local or local in part for part in (first, last) if part)
 
 
 def match_site_email(person: Person, emails, site_domain: str, other_first_names: list) -> str:
