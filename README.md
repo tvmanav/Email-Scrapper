@@ -148,7 +148,8 @@ yet, skipping anyone already attempted (tracked in `apollo_enrich_done.txt`
 | Variable | Default | Purpose |
 |---|---|---|
 | `APOLLO_MAX_PER_RUN` | `0` (no limit) | Stop after this many profiles. |
-| `APOLLO_PACE_SECONDS` | `4` | Delay between profiles. |
+| `APOLLO_PACE_MIN_SECONDS` / `APOLLO_PACE_MAX_SECONDS` | `25` / `55` | Randomized delay range between profiles. A fixed delay is itself a bot signature; lowering this risks LinkedIn temporarily blocking the account (there's no technical fix for that if it happens — only LinkedIn's own recovery flow). |
+| `APOLLO_BREAK_EVERY` / `APOLLO_BREAK_SECONDS` | `8` / `300` | Take a longer break (default 5 min) after this many profiles. |
 
 **Never run `company_email_finder.py` and `apollo_linkedin_enrich.py` at
 the same time** — the Apollo script loads the whole CSV into memory once

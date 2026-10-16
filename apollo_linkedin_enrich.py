@@ -22,11 +22,23 @@ Normal run:
 Env vars:
   APOLLO_PROFILE_DIR     profile directory (default: .apollo_profile)
   APOLLO_MAX_PER_RUN     stop after this many profiles (0 = no limit, default 0)
-  APOLLO_PACE_SECONDS    delay between profiles, in seconds (default 4)
+  APOLLO_PACE_MIN_SECONDS   shortest delay between profiles, in seconds (default 25)
+  APOLLO_PACE_MAX_SECONDS   longest delay between profiles, in seconds (default 55)
+  APOLLO_BREAK_EVERY        take a longer break after this many profiles (default 8)
+  APOLLO_BREAK_SECONDS      length of that longer break, in seconds (default 300)
+
+A fixed, exact delay between profile visits is itself a bot signature -
+LinkedIn's abuse detection flags request *regularity*, not just rate. The
+default pacing here is deliberately slow and randomized (and takes a
+multi-minute break periodically) after a real run at a faster, fixed pace
+got the logged-in account temporarily blocked. Lower these at your own
+risk - a blocked account requires LinkedIn's own recovery flow to restore
+and there is no technical workaround for that.
 """
 import csv
 import logging
 import os
+import random
 import re
 from pathlib import Path
 from typing import Optional
@@ -75,7 +87,13 @@ def launch_extension_profile(p, headless: bool):
 DEBUG_DIR = Path("apollo_enrich_debug")
 
 MAX_PER_RUN = int(os.getenv("APOLLO_MAX_PER_RUN", "0"))
-PACE_SECONDS = float(os.getenv("APOLLO_PACE_SECONDS", "4"))
+# A fixed delay is itself a bot signature - LinkedIn flags request
+# regularity, not just rate. See the module docstring: this got the
+# account temporarily blocked when run at a faster, fixed pace.
+PACE_MIN_SECONDS = float(os.getenv("APOLLO_PACE_MIN_SECONDS", "25"))
+PACE_MAX_SECONDS = float(os.getenv("APOLLO_PACE_MAX_SECONDS", "55"))
+BREAK_EVERY = int(os.getenv("APOLLO_BREAK_EVERY", "8"))
+BREAK_SECONDS = float(os.getenv("APOLLO_BREAK_SECONDS", "300"))
 NAV_TIMEOUT_MS = 20_000
 WAIT_AFTER_LOAD_MS = 4_000
 
@@ -411,7 +429,11 @@ def main() -> None:
                 logger.warning("All three extensions report no credits left; stopping.")
                 break
 
-            page.wait_for_timeout(int(PACE_SECONDS * 1000))
+            if BREAK_EVERY > 0 and i % BREAK_EVERY == 0 and i < len(todo):
+                logger.info("Taking a %.0fs break after %d profiles...", BREAK_SECONDS, i)
+                page.wait_for_timeout(int(BREAK_SECONDS * 1000))
+            else:
+                page.wait_for_timeout(int(random.uniform(PACE_MIN_SECONDS, PACE_MAX_SECONDS) * 1000))
 
         context.close()
 
