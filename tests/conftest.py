@@ -31,6 +31,7 @@ def isolate(monkeypatch):
     """No real network, search or sleeping in any test."""
     m.robots_cache.clear()
     m._existing_groups_cache = None
+    m._quota_exhausted.clear()
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     # main() auto-probes Clutch access for every Clutch-based SOURCE; a test
     # exercising routing/logic (not the probe itself) never wants a real

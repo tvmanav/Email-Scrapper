@@ -99,6 +99,7 @@ With no environment variables, this:
 | `CLUTCH_ALL_PAGES` | `1122` | Upper bound on listing pages for `clutch_all` — the real listing is far smaller in practice for most categories, but this caps a runaway walk. Lower it (e.g. `CLUTCH_ALL_PAGES=25`) to bound a single run. |
 | `MAX_COMPANIES` | `0` (all) | Cap the number of companies actually processed — handy while testing. For `clutch_sitemap` this also caps how many profiles are resolved via Wayback in that run, since resolving is itself a network round-trip per profile. |
 | `CLUTCH_SITEMAP_SERVICE_KEYWORD` | `""` (none) | For `clutch_sitemap`: case-insensitive substring match against each profile's listed service lines (e.g. `developer`). Empty means no filtering — every profile is kept. |
+| `CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE` | `15` | For `clutch_sitemap`: how many profiles to resolve via Wayback before crawling and saving that batch. Kept small since resolving is a slow, rate-limited round trip per profile — raising it means fewer but larger gaps before results land in `company_emails.csv`. |
 | `USE_LLM` | `1` | Set to `0` to skip every Groq call entirely; emails/people then come from heuristics only (no API key needed). |
 | `WORKERS` | `4` | Companies processed in parallel. |
 | `CLUTCH_HEADED` | `0` | Set to `1` to render every Clutch page in a visible window (debugging). |

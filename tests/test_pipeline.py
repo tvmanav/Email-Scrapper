@@ -216,6 +216,16 @@ class TestProcessCompany:
         rows = m.process_company(CO, [])
         assert any(r["company_email"] == "info@acme.nl" for r in rows)
 
+    def test_rate_limit_stops_instead_of_falling_back_to_heuristics(self, pipeline):
+        """A RateLimitError means the daily quota is gone, not a burst (see
+        analyze_with_llm's own retry loop) - every company from here on
+        would be heuristics-only, so this flags the run to stop rather than
+        quietly using the heuristics that worked for every other failure."""
+        pipeline["llm"] = TestRerunGeneric.quota_error()
+        rows = m.process_company(CO, [])
+        assert rows == [m.empty_result(CO)]  # no heuristics-only row written for this company
+        assert m._quota_exhausted.is_set()
+
     def test_linkedin_failure_keeps_emails(self, pipeline):
         pipeline["enrich"] = RuntimeError("search exploded")
         queue = []
@@ -428,6 +438,25 @@ class TestRunChunked:
 
         assert chunks_seen == [["C0", "C1"], ["C2", "C3"], ["C4"]]
         assert list(pd.read_csv(out).fillna("").company_name) == ["C0", "C1", "C2", "C3", "C4"]
+
+    def test_stops_after_the_chunk_where_quota_runs_out(self, tmp_path, monkeypatch):
+        out = tmp_path / "out.csv"
+        monkeypatch.setattr(m, "OUTPUT_FILE", str(out))
+        monkeypatch.setattr(m, "CHUNK_SIZE", 2)
+        monkeypatch.setattr(m, "ENABLE_SECOND_PASS", False)
+        chunks_seen = []
+
+        def run(companies, retry_queue):
+            chunks_seen.append([c.name for c in companies])
+            m._quota_exhausted.set()  # as process_company would on a RateLimitError
+            return [[m.empty_result(c)] for c in companies]
+
+        monkeypatch.setattr(m, "run_companies", run)
+
+        m.run_chunked([m.Company(f"C{i}", f"https://c{i}.com") for i in range(5)])
+
+        assert chunks_seen == [["C0", "C1"]]  # the remaining chunks are never started
+        assert list(pd.read_csv(out).fillna("").company_name) == ["C0", "C1"]  # but this chunk's rows are still saved
 
     def test_saves_are_suppressed_during_a_chunk_and_restored_after(self, tmp_path, monkeypatch):
         out = tmp_path / "out.csv"
@@ -797,6 +826,22 @@ class TestClutchCountries:
         m.run_countries(["se", "no"])
         assert crawled == [] and asked == []
         assert (files / "countries_done.txt").read_text().split() == ["se"]
+
+    def test_quota_exhaustion_stops_and_leaves_the_country_unmarked(self, files, monkeypatch):
+        self.listing(monkeypatch, {
+            "se": [[m.Company("A", "https://a.se")]],
+            "no": [[m.Company("B", "https://b.no")]],
+        })
+        crawled = []
+
+        def run_chunked(companies):
+            crawled.append([c.name for c in companies])
+            m._quota_exhausted.set()
+
+        monkeypatch.setattr(m, "run_chunked", run_chunked)
+        m.run_countries(["se", "no"])
+        assert crawled == [["A"]]  # "no" is never even started
+        assert not (files / "countries_done.txt").exists()  # "se" stays unmarked, resumed next run
 
     def test_discovers_countries_with_sweden_first(self, monkeypatch):
         html = '<a href="/no/developers">x</a><a href="https://clutch.co/se/developers/java">y</a><a href="/dk/developers">z</a>'

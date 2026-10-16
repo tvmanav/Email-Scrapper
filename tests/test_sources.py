@@ -397,10 +397,21 @@ class TestEnsureClutchAccess:
         monkeypatch.setattr(m, "SOURCE", "clutch_sitemap")
         called = []
         monkeypatch.setattr(m, "ensure_clutch_access", lambda: called.append(1))
-        monkeypatch.setattr(m, "collect_clutch_sitemap", lambda limit: [])
-        monkeypatch.setattr(m, "run_chunked", lambda companies: None)
+        monkeypatch.setattr(m, "run_clutch_sitemap", lambda limit: None)
         m.main()
         assert called == []  # no Cloudflare dependency, so no probe
+
+
+class TestLogFinished:
+    def test_logs_plain_finished_when_quota_is_fine(self, caplog):
+        m.log_finished()
+        assert "Finished." in caplog.text
+        assert "quota" not in caplog.text.lower()
+
+    def test_logs_a_distinct_message_when_quota_ran_out(self, caplog):
+        m._quota_exhausted.set()
+        m.log_finished()
+        assert "quota is exhausted" in caplog.text.lower()
 
 
 SITEMAP_INDEX = (
@@ -558,36 +569,14 @@ class TestExtractClutchSitemapCompany:
         assert m.extract_clutch_sitemap_company(PROFILE_HTML) is not None
 
 
-class TestLoadClutchSitemapCompanies:
-    def test_dedupes_by_domain(self, tmp_path, monkeypatch):
-        resolved = tmp_path / "resolved.jsonl"
-        resolved.write_text(
-            '{"name": "Acme", "url": "https://acme.com"}\n'
-            '{"name": "Acme Dup", "url": "https://www.acme.com/en"}\n'
-            '{"name": "Beta", "url": "https://beta.io"}\n'
-        )
-        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(resolved))
-        companies = m.load_clutch_sitemap_companies()
-        assert [c.name for c in companies] == ["Acme", "Beta"]
-
-    def test_missing_file_returns_empty_list(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(tmp_path / "missing.jsonl"))
-        assert m.load_clutch_sitemap_companies() == []
-
-
-class TestCollectClutchSitemap:
-    def setup(self, tmp_path, monkeypatch, profiles):
-        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(tmp_path / "resolved.jsonl"))
-        monkeypatch.setattr(m, "CLUTCH_SITEMAP_DONE_FILE", str(tmp_path / "done.txt"))
-        monkeypatch.setattr(m, "discover_clutch_sitemap_profiles", lambda: profiles)
-
-    def test_resolves_every_profile_and_returns_deduped_companies(self, tmp_path, monkeypatch):
+class TestResolveClutchSitemapChunk:
+    def test_resolves_and_checkpoints_each_profile(self, tmp_path, monkeypatch):
+        resolved_file = tmp_path / "resolved.jsonl"
+        done_file = tmp_path / "done.txt"
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(resolved_file))
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_DONE_FILE", str(done_file))
         profiles = ["https://clutch.co/profile/acme", "https://clutch.co/profile/beta"]
-        self.setup(tmp_path, monkeypatch, profiles)
-        html_by_url = {
-            profiles[0]: "<html>acme</html>",
-            profiles[1]: "<html>beta</html>",
-        }
+        html_by_url = {profiles[0]: "<html>acme</html>", profiles[1]: "<html>beta</html>"}
         companies_by_html = {
             "<html>acme</html>": m.Company("Acme", "https://acme.com"),
             "<html>beta</html>": m.Company("Beta", "https://beta.io"),
@@ -595,41 +584,106 @@ class TestCollectClutchSitemap:
         monkeypatch.setattr(m, "fetch_wayback_html", lambda url: html_by_url[url])
         monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: companies_by_html[html])
 
-        companies = m.collect_clutch_sitemap(0)
+        companies = m.resolve_clutch_sitemap_chunk(profiles)
 
         assert [c.name for c in companies] == ["Acme", "Beta"]
+        assert done_file.read_text().splitlines() == profiles
+        assert len(resolved_file.read_text().splitlines()) == 2
 
     def test_profile_with_no_snapshot_is_skipped_but_still_marked_done(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(tmp_path / "resolved.jsonl"))
+        done_file = tmp_path / "done.txt"
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_DONE_FILE", str(done_file))
         profiles = ["https://clutch.co/profile/acme", "https://clutch.co/profile/gone"]
-        self.setup(tmp_path, monkeypatch, profiles)
         monkeypatch.setattr(m, "fetch_wayback_html", lambda url: "<html>x</html>" if "acme" in url else None)
         monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: m.Company("Acme", "https://acme.com"))
 
-        companies = m.collect_clutch_sitemap(0)
+        companies = m.resolve_clutch_sitemap_chunk(profiles)
 
         assert [c.name for c in companies] == ["Acme"]
-        done = (tmp_path / "done.txt").read_text()
+        done = done_file.read_text()
         assert "acme" in done and "gone" in done  # both marked done - "gone" has no snapshot, not an error to retry
+
+    def test_profile_with_no_matching_company_is_skipped_but_still_marked_done(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVED_FILE", str(tmp_path / "resolved.jsonl"))
+        done_file = tmp_path / "done.txt"
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_DONE_FILE", str(done_file))
+        profiles = ["https://clutch.co/profile/acme"]
+        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: "<html>x</html>")
+        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: None)
+
+        companies = m.resolve_clutch_sitemap_chunk(profiles)
+
+        assert companies == []
+        assert "acme" in done_file.read_text()
+
+
+class TestRunClutchSitemap:
+    def setup(self, tmp_path, monkeypatch, profiles):
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_DONE_FILE", str(tmp_path / "done.txt"))
+        monkeypatch.setattr(m, "discover_clutch_sitemap_profiles", lambda: profiles)
+
+    def test_resolves_in_chunks_and_runs_each_chunk_immediately(self, tmp_path, monkeypatch):
+        profiles = [f"https://clutch.co/profile/p{i}" for i in range(5)]
+        self.setup(tmp_path, monkeypatch, profiles)
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE", 2)
+        resolved_chunks = [
+            [m.Company("A", "https://a.com"), m.Company("B", "https://b.com")],
+            [m.Company("C", "https://c.com")],
+            [],  # last chunk resolves nothing
+        ]
+        resolve_calls = []
+
+        def fake_resolve(chunk):
+            resolve_calls.append(list(chunk))
+            return resolved_chunks[len(resolve_calls) - 1]
+
+        monkeypatch.setattr(m, "resolve_clutch_sitemap_chunk", fake_resolve)
+        run_calls = []
+        monkeypatch.setattr(m, "run_chunked", lambda companies: run_calls.append([c.name for c in companies]))
+
+        m.run_clutch_sitemap(0)
+
+        assert resolve_calls == [profiles[0:2], profiles[2:4], profiles[4:5]]
+        assert run_calls == [["A", "B"], ["C"]]  # the empty chunk never calls run_chunked
+
+    def test_stops_resolving_more_profiles_once_quota_is_exhausted(self, tmp_path, monkeypatch):
+        """Resolution now runs in a background thread, overlapped with
+        crawling (see run_clutch_sitemap's docstring), so the resolver may
+        legitimately have one extra batch already in flight - the queue's
+        maxsize=1 - by the time the consumer flags the quota. That slack is
+        bounded, though: it must not blow through every remaining batch."""
+        profiles = [f"https://clutch.co/profile/p{i}" for i in range(20)]
+        self.setup(tmp_path, monkeypatch, profiles)
+        monkeypatch.setattr(m, "CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE", 2)  # 10 batches total
+        resolve_calls = []
+        monkeypatch.setattr(m, "resolve_clutch_sitemap_chunk",
+                             lambda chunk: resolve_calls.append(list(chunk)) or [m.Company("X", "https://x.com")])
+        monkeypatch.setattr(m, "run_chunked", lambda companies: m._quota_exhausted.set())
+
+        m.run_clutch_sitemap(0)
+
+        assert 1 <= len(resolve_calls) < 10  # stops well short of all 10 batches
 
     def test_resumes_by_skipping_already_done_profiles(self, tmp_path, monkeypatch):
         profiles = ["https://clutch.co/profile/acme", "https://clutch.co/profile/beta"]
         self.setup(tmp_path, monkeypatch, profiles)
         (tmp_path / "done.txt").write_text(profiles[0] + "\n")
-        fetched = []
-        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: fetched.append(url) or "<html>x</html>")
-        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: m.Company("Beta", "https://beta.io"))
+        resolve_calls = []
+        monkeypatch.setattr(m, "resolve_clutch_sitemap_chunk", lambda chunk: resolve_calls.append(chunk) or [])
+        monkeypatch.setattr(m, "run_chunked", lambda companies: None)
 
-        m.collect_clutch_sitemap(0)
+        m.run_clutch_sitemap(0)
 
-        assert fetched == [profiles[1]]  # already-done "acme" is never re-fetched
+        assert resolve_calls == [[profiles[1]]]  # already-done "acme" is never re-resolved
 
     def test_limit_caps_how_many_profiles_are_processed(self, tmp_path, monkeypatch):
         profiles = [f"https://clutch.co/profile/p{i}" for i in range(5)]
         self.setup(tmp_path, monkeypatch, profiles)
-        fetched = []
-        monkeypatch.setattr(m, "fetch_wayback_html", lambda url: fetched.append(url) or "<html>x</html>")
-        monkeypatch.setattr(m, "extract_clutch_sitemap_company", lambda html: m.Company("X", f"https://{len(fetched)}.com"))
+        resolve_calls = []
+        monkeypatch.setattr(m, "resolve_clutch_sitemap_chunk", lambda chunk: resolve_calls.append(chunk) or [])
+        monkeypatch.setattr(m, "run_chunked", lambda companies: None)
 
-        m.collect_clutch_sitemap(2)
+        m.run_clutch_sitemap(2)
 
-        assert len(fetched) == 2
+        assert sum(len(c) for c in resolve_calls) == 2

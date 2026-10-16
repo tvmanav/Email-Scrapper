@@ -3,6 +3,7 @@ import os
 import re
 import csv
 import json
+import queue
 import socket
 import subprocess
 import threading
@@ -114,8 +115,15 @@ CLUTCH_SITEMAP_DONE_FILE = "clutch_sitemap_done.txt"
 # Clutch's own category-specific listing pages do, so this is a best-effort
 # stand-in; empty (default) means no filtering - every profile is kept.
 CLUTCH_SITEMAP_SERVICE_KEYWORD = os.getenv("CLUTCH_SITEMAP_SERVICE_KEYWORD", "").strip().lower()
+# Resolving one profile via Wayback is a slow, rate-limited round trip, so
+# this is deliberately much smaller than CHUNK_SIZE (used elsewhere for
+# cheap in-memory batching): it controls how many companies pile up before
+# any of them get crawled and saved. CHUNK_SIZE's 200 would mean ~15-20
+# minutes of silent resolving before the first row ever reaches OUTPUT_FILE.
+CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE = int(os.getenv("CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE", "15"))
 WAYBACK_MAX_RETRIES = 3
 WAYBACK_RETRY_DELAY_SECONDS = 20  # archive.org rate-limits hard; back off rather than give up
+WAYBACK_REQUEST_DELAY = 1  # paces requests between profiles; unpaced bursts get Cloudflare's own 403 abuse page
 
 # A page with no extracted email can't supply a validated email on its
 # own, so the LLM context prioritizes pages that have one and caps
@@ -1035,32 +1043,51 @@ def extract_clutch_sitemap_company(html: str) -> Optional[Company]:
     return Company(name=name, url=website)
 
 
-def load_clutch_sitemap_companies() -> List[Company]:
-    """Unique-by-domain companies already resolved in a previous run."""
-    companies, seen = [], set()
-    if os.path.exists(CLUTCH_SITEMAP_RESOLVED_FILE):
-        with open(CLUTCH_SITEMAP_RESOLVED_FILE) as f:
-            for line in f:
-                item = json.loads(line)
-                domain = get_domain(item["url"])
-                if domain and domain not in seen:
-                    seen.add(domain)
-                    companies.append(Company(name=item["name"], url=item["url"]))
+def resolve_clutch_sitemap_chunk(profiles: List[str]) -> List[Company]:
+    """
+    Resolves one chunk of profile URLs to companies via their Wayback
+    snapshot, checkpointing each profile as done (and each resolved company)
+    as it goes - so the overall walk is resumable profile by profile, not
+    just chunk by chunk.
+    """
+    resolved = []
 
-    return companies
+    for profile_url in profiles:
+        html = fetch_wayback_html(profile_url)
+
+        if html is not None:
+            company = extract_clutch_sitemap_company(html)
+            if company:
+                resolved.append(company)
+                with open(CLUTCH_SITEMAP_RESOLVED_FILE, "a") as f:
+                    f.write(json.dumps({"name": company.name, "url": company.url}) + "\n")
+
+        with open(CLUTCH_SITEMAP_DONE_FILE, "a") as f:
+            f.write(profile_url + "\n")
+
+        time.sleep(WAYBACK_REQUEST_DELAY)
+
+    return resolved
 
 
-def collect_clutch_sitemap(limit: int) -> List[Company]:
+def run_clutch_sitemap(limit: int) -> None:
     """
     Alternative Clutch discovery that never needs Cloudflare clearance:
     walks profile URLs from Clutch's own sitemap and reads each one's
     archived Wayback Machine snapshot instead of the live, Cloudflare-
-    gated profile page. Resolved companies are cached in
-    CLUTCH_SITEMAP_RESOLVED_FILE and done profiles tracked in
-    CLUTCH_SITEMAP_DONE_FILE, so a long run can be stopped and resumed.
-    Archived snapshots can lag behind a company's current real site, and
-    there's no per-category filter the way Clutch's own listing pages have;
-    CLUTCH_SITEMAP_SERVICE_KEYWORD only approximates one.
+    gated profile page. Archived snapshots can lag behind a company's
+    current real site, and there's no per-category filter the way Clutch's
+    own listing pages have; CLUTCH_SITEMAP_SERVICE_KEYWORD only
+    approximates one.
+
+    Resolving a profile (Wayback) and crawling a resolved company (its own
+    site) hit entirely different, unrelated servers, so there's no reason
+    to run them as alternating phases - a background thread resolves
+    batches continuously while this one crawls and saves each batch as
+    soon as it's ready, overlapping the two instead of idling through one
+    while the other sits unused. The queue's maxsize keeps the resolver at
+    most one batch ahead, so it doesn't keep burning through Wayback's
+    rate limit if crawling (or the daily LLM quota) is the one falling behind.
     """
     profiles = discover_clutch_sitemap_profiles()
     done = read_lines(CLUTCH_SITEMAP_DONE_FILE)
@@ -1068,25 +1095,44 @@ def collect_clutch_sitemap(limit: int) -> List[Company]:
     if limit > 0:
         todo = todo[:limit]
 
-    resolved = 0
+    total = len(todo)
+    batches = [todo[i:i + CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE] for i in range(0, total, CLUTCH_SITEMAP_RESOLVE_BATCH_SIZE)]
+    resolved_queue: queue.Queue = queue.Queue(maxsize=1)
 
-    for i, profile_url in enumerate(todo, 1):
-        html = fetch_wayback_html(profile_url)
+    def resolve_in_background():
+        try:
+            for batch in batches:
+                if _quota_exhausted.is_set():
+                    break
+                resolved_queue.put((len(batch), resolve_clutch_sitemap_chunk(batch)))
+        finally:
+            resolved_queue.put(None)  # sentinel: no more batches coming
 
-        if html is not None:
-            company = extract_clutch_sitemap_company(html)
-            if company:
-                resolved += 1
-                with open(CLUTCH_SITEMAP_RESOLVED_FILE, "a") as f:
-                    f.write(json.dumps({"name": company.name, "url": company.url}) + "\n")
+    resolver = threading.Thread(target=resolve_in_background, daemon=True)
+    resolver.start()
 
-        with open(CLUTCH_SITEMAP_DONE_FILE, "a") as f:
-            f.write(profile_url + "\n")
+    processed = 0
+    while True:
+        item = resolved_queue.get()
+        if item is None:
+            break
 
-        if i % 50 == 0 or i == len(todo):
-            logger.info("Sitemap discovery: %d/%d profiles processed, %d companies resolved", i, len(todo), resolved)
+        batch_len, companies = item
+        processed += batch_len
 
-    return load_clutch_sitemap_companies()
+        logger.info(
+            "Sitemap discovery: %d/%d profiles processed, %d companies resolved this batch",
+            processed, total, len(companies),
+        )
+
+        if companies:
+            run_chunked(companies)
+
+        if _quota_exhausted.is_set():
+            # Resolving more profiles would just queue up more companies no
+            # LLM pass can validate today - stop here; already-resolved
+            # profiles stay checkpointed, so a later run picks up from here.
+            return
 
 
 # ============================================================
@@ -2139,9 +2185,21 @@ def process_company(company: Company, retry_queue: list) -> List[dict]:
 
         try:
             llm_result = analyze_with_llm(company, pages)
+        except RateLimitError:
+            # A RateLimitError escaping analyze_with_llm's own retry loop means
+            # the wait wasn't short - the daily quota is gone, not a burst.
+            # Every company from here on would otherwise get a heuristics-only
+            # (lower-confidence) result instead of an LLM-validated one, so
+            # this stops the run instead of quietly degrading it: flag it and
+            # leave this company for a later run (picked up by rerun_generic,
+            # same as any other company with no decision-maker email yet).
+            logger.warning("Groq quota exhausted on %s; stopping so the rest stay LLM-validated.", company.name)
+            _quota_exhausted.set()
+            return [empty_result(company)]
         except Exception:
-            # Quota or API trouble must not throw away emails the crawl already
-            # found: validate_result falls back to its heuristics on an empty result.
+            # Any other LLM trouble must not throw away emails the crawl
+            # already found: validate_result falls back to its heuristics on
+            # an empty result.
             logger.exception("LLM analysis failed, using heuristics only: %s", company.name)
             llm_result = LLMDecision()
 
@@ -2290,6 +2348,10 @@ def second_pass(retry_queue: list, results: list):
 
 
 _suppress_saves = False  # chunked mode appends rows itself instead of rewriting the CSV
+# Set once Groq's daily quota is confirmed gone (see process_company); every
+# chunk/country/profile-batch loop checks this and stops rather than keep
+# collecting heuristics-only (lower-confidence) rows for the rest of the run.
+_quota_exhausted = threading.Event()
 
 # (OUTPUT_FILE, mtime) -> the groups we last loaded/wrote for it. save_results()
 # is called once per company in a tight loop (see run_companies), and without
@@ -2698,6 +2760,12 @@ def run_countries(countries: List[str]):
         logger.info("%s: %d companies listed", country, len(companies))
         run_chunked(companies)
 
+        if _quota_exhausted.is_set():
+            # This country isn't marked done: run_chunked stopped partway
+            # through it, so a later run must still pick up where it left off
+            # (its own domain-dedup against OUTPUT_FILE skips what's already saved).
+            return
+
         with open(COUNTRIES_DONE_FILE, "a") as f:
             f.write(f"{country}\n")
 
@@ -2738,6 +2806,10 @@ def run_chunked(companies: List[Company]):
             )
         logger.info("Chunk saved: %d/%d companies done", len(done) + start + len(chunk), len(companies))
 
+        if _quota_exhausted.is_set():
+            logger.warning("Stopping: Groq's daily quota is exhausted. Run again later (or rerun_generic) to continue.")
+            return
+
 
 def ensure_clutch_access() -> None:
     """A bare `python3 company_email_finder.py` on a machine that has never
@@ -2770,6 +2842,13 @@ def ensure_clutch_access() -> None:
     logger.info("Clutch verified - continuing.")
 
 
+def log_finished():
+    if _quota_exhausted.is_set():
+        logger.warning("Stopped early: Groq's daily quota is exhausted. Run again later (or rerun_generic) to continue.")
+    else:
+        logger.info("Finished.")
+
+
 def main():
     if SOURCE == "clutch_verify":
         if verify_clutch_access():
@@ -2794,19 +2873,18 @@ def main():
         return
     elif SOURCE == "clutch_countries":
         run_countries(CLUTCH_COUNTRIES or discover_clutch_countries())
-        logger.info("Finished.")
+        log_finished()
         return
     elif SOURCE == "clutch_all":
         companies = collect_clutch_all(CLUTCH_URL)
         if MAX_COMPANIES > 0:
             companies = companies[:MAX_COMPANIES]
         run_chunked(companies)
-        logger.info("Finished.")
+        log_finished()
         return
     elif SOURCE == "clutch_sitemap":
-        companies = collect_clutch_sitemap(MAX_COMPANIES)
-        run_chunked(companies)
-        logger.info("Finished.")
+        run_clutch_sitemap(MAX_COMPANIES)
+        log_finished()
         return
     else:
         raise RuntimeError(
@@ -2825,7 +2903,7 @@ def main():
     if ENABLE_SECOND_PASS and retry_queue:
         second_pass(retry_queue, results)
 
-    logger.info("Finished.")
+    log_finished()
 
 
 if __name__ == "__main__":
