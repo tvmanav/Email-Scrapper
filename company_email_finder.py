@@ -567,7 +567,15 @@ def normalize_linkedin_url(url: str) -> Optional[tuple]:
     if not match:
         return None
 
-    kind, slug = match.group(1).lower(), match.group(2).rstrip("/")
+    kind = match.group(1).lower()
+    # The slug regex has to allow "." (real slugs like "acme.inc" exist), so
+    # a link embedded in a sentence ("...on LinkedIn: linkedin.com/company/acme.")
+    # ends up with the sentence's closing punctuation swallowed into the
+    # slug - a real vanity slug never ends in one of these, so it's safe to
+    # strip trailing occurrences without risking a genuine slug character.
+    slug = match.group(2).rstrip("/.,;:!?)]}\"'")
+    if not slug:
+        return None
 
     return kind, f"https://www.linkedin.com/{kind}/{slug}"
 
