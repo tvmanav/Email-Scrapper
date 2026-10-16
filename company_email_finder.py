@@ -4,6 +4,7 @@ import re
 import csv
 import json
 import socket
+import subprocess
 import threading
 import time
 import unicodedata
@@ -642,13 +643,36 @@ def parse_page(url: str, html: str) -> PageData:
 # CLUTCH EXTRACTION
 # ============================================================
 
+def clutch_user_agent(p) -> str:
+    """
+    USER_AGENT's Chrome version is a hardcoded snapshot that drifts out of
+    sync with whatever Chromium build Playwright actually bundles (it auto-
+    updates; the constant doesn't). Chromium generates its real version into
+    Client Hints headers on its own regardless of this override, so a stale
+    claimed version creates exactly the kind of UA-vs-reality mismatch
+    Cloudflare's bot detection looks for. Build the UA from the browser's
+    real, installed version instead, falling back to the static one if that
+    can't be determined (e.g. in tests, where there's no real browser).
+    """
+    try:
+        output = subprocess.check_output([p.chromium.executable_path, "--version"], timeout=5, text=True)
+        version = re.search(r"\d+\.\d+\.\d+\.\d+", output).group(0)
+    except Exception:
+        return USER_AGENT
+
+    return (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    )
+
+
 def open_clutch_context(p, headless: bool):
     """Persistent browser profile, so a Cloudflare check passed once keeps counting."""
     context = p.chromium.launch_persistent_context(
         CLUTCH_PROFILE_DIR,
         headless=headless,
         args=["--disable-blink-features=AutomationControlled"],
-        user_agent=USER_AGENT,
+        user_agent=clutch_user_agent(p),
         viewport={"width": 1366, "height": 900},
         locale="en-US",
     )
